@@ -1,0 +1,218 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<title>H.A.I.L. Sentinel</title>
+<meta name="description" content="H.A.I.L. Sentinel - private peer-to-peer camera stations from your own iPhones.">
+<meta name="theme-color" content="#0A0A0A">
+<meta name="color-scheme" content="dark">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Sentinel">
+<meta name="format-detection" content="telephone=no">
+<link rel="manifest" href="manifest.json">
+<link rel="apple-touch-icon" href="icons/icon-180.png">
+<link rel="apple-touch-icon" sizes="180x180" href="icons/icon-180.png">
+<link rel="apple-touch-icon" sizes="167x167" href="icons/icon-167.png">
+<link rel="apple-touch-icon" sizes="152x152" href="icons/icon-152.png">
+<link rel="icon" type="image/png" sizes="64x64" href="icons/favicon-64.png">
+<link rel="stylesheet" href="css/app.css">
+<script src="vendor/peerjs-1.5.5.min.js" defer></script>
+<script src="vendor/jsQR-1.4.0.js" defer></script>
+<script src="vendor/qrcode-generator-2.0.4.js" defer></script>
+<script type="module" src="js/app.js"></script>
+</head>
+<body>
+
+<!-- ROLE PICKER -->
+<section id="role" class="screen">
+  <img class="banner" src="img/banner.jpg" alt="HYDRA Advanced Intelligence">
+  <p class="kicker center" style="margin-top:16px">H.A.I.L. Sentinel</p>
+  <h1 class="center">Choose this device's role</h1>
+  <p class="muted center small">You can change it later in Settings.</p>
+  <button class="btn block gold" data-role="command" style="min-height:90px;flex-direction:column"><b>COMMAND CENTER</b><span class="small">Watch your camera stations</span></button>
+  <button class="btn block" data-role="station" style="min-height:90px;flex-direction:column;border-color:#B11226"><b>CAMERA STATION</b><span class="small muted">Turn this spare iPhone into a camera</span></button>
+  <div class="notice gold small">Everything stays on your devices. Video goes phone-to-phone over encrypted WebRTC. Nothing is uploaded.</div>
+</section>
+
+<!-- COMMAND CENTER HOME -->
+<section id="home" class="screen">
+  <img class="banner" src="img/banner.jpg" alt="HYDRA Advanced Intelligence">
+  <div class="row" style="margin-top:10px"><span class="kicker grow">Command Center</span><span id="brokerChip" class="chip offline">Broker</span></div>
+  <button id="liveBtn" class="live-btn"><span id="liveBtnLabel">LIVE VIEW</span><small id="liveBtnSub"></small></button>
+  <h3>Stations</h3>
+  <ul id="homeStations" class="list"></ul>
+  <div class="grid2">
+    <button class="btn" data-go="stations">Stations &amp; devices</button>
+    <button class="btn crimson" id="homePair">+ Add device</button>
+    <button class="btn" data-go="vault">Vault</button>
+    <button class="btn" data-go="settings">Settings</button>
+  </div>
+  <p class="muted small center" style="margin-top:18px">ANALYZE // AUTOMATE // DOMINATE</p>
+</section>
+
+<!-- PAIR (command center shows QR) -->
+<section id="pair" class="screen">
+  <div class="topbar"><button class="btn icon ghost" data-back>&#8249;</button><h2>Pair a station</h2></div>
+  <p class="muted small">On the spare iPhone: open Sentinel, choose <b>Camera Station</b>, tap <b>Pair with command center</b> and scan this code. The station must tap <b>Approve</b>.</p>
+  <div class="qrbox"><canvas id="pairQr" aria-label="Pairing QR code"></canvas></div>
+  <div id="pairCountdown" class="countdown">5:00</div>
+  <p id="pairStatus" class="center muted small">Single-use code. Expires in 5 minutes.</p>
+  <button class="btn block" id="pairRefresh">New code</button>
+  <button class="btn block ghost" id="pairUseOffline">No internet? Use offline pairing</button>
+</section>
+
+<!-- OFFLINE EXCHANGE (command center) -->
+<section id="offline" class="screen">
+  <div class="topbar"><button class="btn icon ghost" data-back>&#8249;</button><h2>Offline pairing</h2></div>
+  <p class="muted small"><b>Step 1.</b> On the camera station tap <b>Pair with command center</b> and scan this code. <b>Step 2.</b> Tap <b>Scan answer</b> here and scan the code the station shows. No server is used.</p>
+  <div class="qrbox"><canvas id="offerQr" aria-label="Offer QR code"></canvas></div>
+  <p id="offerInfo" class="center muted small">Preparing secure offer…</p>
+  <button class="btn block gold" id="scanAnswer">Scan answer</button>
+  <details class="card"><summary class="muted small">Copy / paste instead of scanning</summary>
+    <textarea id="offerText" class="code" readonly></textarea>
+    <button class="btn block" id="copyOffer">Copy offer code</button>
+    <textarea id="answerPaste" class="code" placeholder="Paste the station's answer code"></textarea>
+    <button class="btn block" id="useAnswer">Use pasted answer</button>
+  </details>
+</section>
+
+<!-- LIVE VIEW -->
+<section id="live" class="screen">
+  <video id="liveVideo" playsinline autoplay muted></video>
+  <div id="staleOverlay" class="stale-overlay"><div class="big">STALE FRAME</div><div id="staleInfo" class="muted" style="margin-top:8px">No new frames</div></div>
+  <div id="liveMsg" class="live-msg">CONNECTING…</div>
+  <div class="live-top">
+    <button class="btn icon ghost" id="liveClose" aria-label="Close">&#10005;</button>
+    <span class="title" id="liveTitle">Station</span>
+    <span id="recBadge" class="badge rec" hidden>● REC <span id="recTime">0:00</span></span>
+    <span id="liveBadge" class="badge wait">CONNECTING</span>
+  </div>
+  <div id="stationStrip" class="station-strip"></div>
+  <div class="live-controls">
+    <button class="ctl" id="btnRecord" aria-label="Record"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="7" fill="#B11226"/></svg>RECORD</button>
+    <button class="ctl" id="btnListen" aria-label="Listen"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 9v6h4l5 4V5L8 9H4z"/><path id="listenWave" d="M16 9a4 4 0 010 6"/></svg>LISTEN</button>
+    <button class="ctl talk" id="btnTalk" aria-label="Hold to talk"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0014 0M12 18v3"/></svg>HOLD TO TALK</button>
+    <button class="ctl" id="btnSwitch" aria-label="Switch camera"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 8h3l2-3h6l2 3h3v11H4z"/><path d="M9 13a3 3 0 015-2l1 1M15 13a3 3 0 01-5 2l-1-1"/></svg>FLIP</button>
+  </div>
+</section>
+
+<!-- LAST STATUS -->
+<section id="status" class="screen">
+  <div class="topbar"><button class="btn icon ghost" data-back>&#8249;</button><h2>Last status</h2></div>
+  <div class="notice small">All stations are offline. These are the last frames received. They are <b>not live</b>.</div>
+  <div id="statusList"></div>
+  <button class="btn block gold" id="statusRetry">Try reconnecting</button>
+</section>
+
+<!-- STATIONS & DEVICES -->
+<section id="stations" class="screen">
+  <div class="topbar"><button class="btn icon ghost" data-back>&#8249;</button><h2>Stations &amp; devices</h2></div>
+  <h3>Stations</h3>
+  <p class="muted small">Name each station and choose which paired device serves it.</p>
+  <div id="stationList"></div>
+  <button class="btn block" id="addStation">+ Add station</button>
+  <div class="hr"></div>
+  <h3>Paired devices</h3>
+  <ul id="deviceList" class="list"></ul>
+  <button class="btn block crimson" id="stationsPair">+ Add device (show pairing QR)</button>
+</section>
+
+<!-- VAULT -->
+<section id="vault" class="screen">
+  <div class="topbar"><button class="btn icon ghost" data-back>&#8249;</button><h2>Recording vault</h2></div>
+  <p class="muted small">Recordings are stored only on this device (IndexedDB).</p>
+  <ul id="vaultList" class="list"></ul>
+  <dialog id="playDlg"><video id="playVideo" controls playsinline style="width:100%;border-radius:10px;background:#0A0A0A"></video><button class="btn block" id="playClose">Close</button></dialog>
+</section>
+
+<!-- SETTINGS -->
+<section id="settings" class="screen">
+  <div class="topbar"><button class="btn icon ghost" data-back>&#8249;</button><h2>Settings</h2></div>
+  <label>Device role</label>
+  <div class="seg" id="segRole"><button data-v="command">Command Center</button><button data-v="station">Camera Station</button></div>
+  <label for="setName">Device name</label><input id="setName" placeholder="e.g. Daryell's iPhone">
+  <label>Signaling</label>
+  <div class="seg" id="segSig"><button data-v="peerjs">PeerJS broker</button><button data-v="offline">Offline QR</button></div>
+  <p class="muted small">PeerJS only introduces the two devices. Video never passes through it.</p>
+  <details class="card"><summary>Broker (self-host later)</summary>
+    <label for="bHost">Host</label><input id="bHost">
+    <div class="grid2"><div><label for="bPort">Port</label><input id="bPort" inputmode="numeric"></div><div><label for="bPath">Path</label><input id="bPath"></div></div>
+    <div class="grid2"><div><label for="bKey">Key</label><input id="bKey"></div><div><label for="bSecure">HTTPS/WSS</label><select id="bSecure"><option value="true">Yes</option><option value="false">No</option></select></div></div>
+  </details>
+  <details class="card"><summary>ICE servers (STUN / TURN)</summary>
+    <label for="sStun">STUN URLs</label><input id="sStun">
+    <label for="sTurn">TURN URL (optional)</label><input id="sTurn" placeholder="turns:turn.example.com:443">
+    <div class="grid2"><div><label for="sTurnU">TURN user</label><input id="sTurnU" autocomplete="off"></div><div><label for="sTurnP">TURN password</label><input id="sTurnP" type="password" autocomplete="off"></div></div>
+    <p class="muted small">TURN credentials are typed here and stored only on this device. They are never in the app code.</p>
+  </details>
+  <button class="btn block gold" id="saveSettings">Save</button>
+  <div class="card small muted" id="aboutBox"></div>
+  <button class="btn block ghost" id="resetAll">Erase all pairings and settings</button>
+</section>
+
+<!-- CAMERA STATION HOME -->
+<section id="stationHome" class="screen">
+  <img class="banner" src="img/banner.jpg" alt="HYDRA Advanced Intelligence">
+  <div class="row" style="margin-top:10px"><span class="kicker grow">Camera Station</span><span id="brokerChip2" class="chip offline">Broker</span></div>
+  <button id="startStation" class="live-btn">START STATION<small>Camera on, ready for your command center</small></button>
+  <button class="btn block crimson" id="stationScan">Pair with command center (scan QR)</button>
+  <h3>Paired command centers</h3>
+  <ul id="ccList" class="list"></ul>
+  <div class="notice small"><b>Keep Sentinel open and the iPhone plugged in.</b> iOS stops the camera whenever this app is closed, switched away from, or the screen locks.</div>
+  <button class="btn block" data-go="settings">Settings</button>
+</section>
+
+<!-- SCANNER -->
+<section id="scan" class="screen">
+  <div class="topbar"><button class="btn icon ghost" data-back>&#8249;</button><h2>Scan QR</h2></div>
+  <div class="scanwrap"><video id="scanVideo" playsinline muted></video><div class="scanframe"></div></div>
+  <p id="scanHint" class="center muted small">Point the camera at the Sentinel QR code.</p>
+  <details class="card"><summary class="muted small">Paste a code instead</summary>
+    <textarea id="scanPaste" class="code" placeholder="Paste a Sentinel code"></textarea>
+    <button class="btn block" id="scanPasteUse">Use code</button>
+  </details>
+</section>
+
+<!-- APPROVE (station) -->
+<section id="approve" class="screen">
+  <div class="topbar"><h2>Approve pairing?</h2></div>
+  <div class="card center">
+    <img src="img/crest-256.png" class="crest" alt="">
+    <p class="kicker">Pairing request</p>
+    <h2 id="approveName">Command center</h2>
+    <p class="muted small" id="approveDetail"></p>
+    <div id="approveCountdown" class="countdown">5:00</div>
+  </div>
+  <p class="small muted">Approving lets this command center view this camera and talk through this iPhone's speaker. Only approve devices you own.</p>
+  <div class="grid2"><button class="btn gold" id="approveYes">Approve</button><button class="btn crimson" id="approveNo">Deny</button></div>
+</section>
+
+<!-- ANSWER (station, offline) -->
+<section id="answer" class="screen">
+  <div class="topbar"><h2>Show this to the command center</h2></div>
+  <p class="muted small">On the command center tap <b>Scan answer</b> and scan this code.</p>
+  <div class="qrbox"><canvas id="answerQr" aria-label="Answer QR code"></canvas></div>
+  <p id="answerInfo" class="center muted small"></p>
+  <details class="card"><summary class="muted small">Copy instead</summary><textarea id="answerText" class="code" readonly></textarea><button class="btn block" id="copyAnswer">Copy answer code</button></details>
+  <button class="btn block ghost" id="answerCancel">Cancel</button>
+</section>
+
+<!-- STATION ACTIVE -->
+<section id="stationActive" class="screen">
+  <div class="row"><span class="kicker grow">H.A.I.L. Sentinel</span><span id="brokerChip3" class="chip offline">Broker</span></div>
+  <div class="station-big"><span class="station-dot"></span> STATION ACTIVE</div>
+  <p class="num muted" id="stationLine">Waiting for command center</p>
+  <video id="stationPreview" playsinline autoplay muted></video>
+  <div id="talkIndicator" class="notice gold" hidden><b>Command center is talking</b></div>
+  <div class="card small" id="stationStatus"></div>
+  <div class="notice small"><b>Do not close Sentinel or lock this iPhone.</b> iOS stops the camera when the app is closed, in the background, or the screen locks. Keep it plugged in with Sentinel open. Set Auto-Lock to Never while it is a station.</div>
+  <div class="grid2"><button class="btn gold" id="dimBtn">Dim screen</button><button class="btn crimson" id="stopStation">Stop station</button></div>
+  <audio id="talkAudio" playsinline></audio>
+</section>
+<div id="dim" class="dim"><div class="dot"></div>STATION ACTIVE · TAP TO WAKE</div>
+<div id="toast" class="toast"></div>
+</body>
+</html>

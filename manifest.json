@@ -1,0 +1,26 @@
+{
+  "name": "H.A.I.L. Sentinel",
+  "short_name": "Sentinel",
+  "description": "Private peer-to-peer camera stations from your own iPhones.",
+  "id": "./",
+  "start_url": "./?source=homescreen",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#0A0A0A",
+  "theme_color": "#0A0A0A",
+  "categories": ["security", "utilities"],
+  "icons": [
+    { "src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "icons/icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" },
+    { "src": "icons/icon-180.png", "sizes": "180x180", "type": "image/png" },
+    { "src": "icons/icon-167.png", "sizes": "167x167", "type": "image/png" },
+    { "src": "icons/icon-152.png", "sizes": "152x152", "type": "image/png" }
+  ],
+  "shortcuts": [
+    { "name": "Hydra Live View", "url": "./?action=live", "icons": [{ "src": "icons/icon-192.png", "sizes": "192x192" }] },
+    { "name": "Hydra Pair Station", "url": "./?action=pair", "icons": [{ "src": "icons/icon-192.png", "sizes": "192x192" }] },
+    { "name": "Camera Station mode", "url": "./?role=station", "icons": [{ "src": "icons/icon-192.png", "sizes": "192x192" }] }
+  ]
+}
