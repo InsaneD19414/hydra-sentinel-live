@@ -1,5 +1,5 @@
 // H.A.I.L. Sentinel service worker: offline app-shell cache. Bump VERSION on every deploy.
-const VERSION = 'sentinel-v1.0.0';
+const VERSION = 'sentinel-v1.1.0';
 const SHELL = [
   './', 'index.html', 'manifest.json', 'css/app.css',
   'js/app.js', 'js/store.js', 'js/codec.js', 'js/rtc.js', 'js/signal.js', 'js/qr.js',

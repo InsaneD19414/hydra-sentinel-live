@@ -111,3 +111,7 @@ video::-webkit-media-controls-panel{background-color:rgba(10,10,10,.6)}
 .seg{display:flex;border:1px solid #2E2E2E;border-radius:12px;overflow:hidden}
 .seg button{flex:1;background:#1A1A1A;border:0;padding:10px;color:#A8A8A8;font-weight:600}
 .seg button.on{background:#B11226;color:#E8E8E8}
+
+#splash{position:fixed;inset:0;z-index:999;background:#0A0A0A;display:flex;align-items:center;justify-content:center;transition:opacity .5s}#splash img{width:min(92vw,720px);height:auto}#splash.hide{opacity:0;pointer-events:none}
+.toplogo{width:34px;height:34px;border-radius:50%;margin-left:auto;border:1px solid #8A6D1C}
+.banner{width:100%;max-width:900px;height:auto;display:block;margin:0 auto}

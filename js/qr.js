@@ -18,7 +18,7 @@ export function drawQr(canvas, text, ecc = 'L') {
 export function decodeCanvas(canvas) {
   const g = canvas.getContext('2d', { willReadFrequently: true });
   const img = g.getImageData(0, 0, canvas.width, canvas.height);
-  const r = window.jsQR(img.data, img.width, img.height, { inversionAttempts: 'dontInvert' });
+  const r = window.jsQR(img.data, img.width, img.height, { inversionAttempts: 'attemptBoth' });
   return r ? r.data : null;
 }
 
@@ -26,7 +26,7 @@ export class QrScanner {
   constructor(video, onResult) { this.video = video; this.onResult = onResult; this.running = false; }
   async start() {
     this.stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false });
-    this.video.srcObject = this.stream; this.video.setAttribute('playsinline', ''); this.video.muted = true;
+    this.video.setAttribute('playsinline', ''); this.video.setAttribute('autoplay', ''); this.video.muted = true; this.video.srcObject = this.stream;
     await this.video.play().catch(() => { });
     this.running = true;
     if ('BarcodeDetector' in window) {
@@ -41,8 +41,8 @@ export class QrScanner {
     if (v.readyState >= 2 && v.videoWidth) {
       try {
         let text = null;
-        if (this.detector) { const codes = await this.detector.detect(v); if (codes.length) text = codes[0].rawValue; }
-        else {
+        if (this.detector) { try { const codes = await this.detector.detect(v); if (codes.length) text = codes[0].rawValue; } catch { this.detector = null; } }
+        if (!text) {
           const scale = Math.min(1, 1280 / Math.max(v.videoWidth, v.videoHeight));
           this.canvas.width = Math.round(v.videoWidth * scale); this.canvas.height = Math.round(v.videoHeight * scale);
           this.canvas.getContext('2d', { willReadFrequently: true }).drawImage(v, 0, 0, this.canvas.width, this.canvas.height);

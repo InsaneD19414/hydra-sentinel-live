@@ -5,7 +5,11 @@ import { MediaSession, iceServersFrom, cameraConstraints } from './rtc.js';
 import { Broker, waitFor, DEFAULT_BROKER } from './signal.js';
 import { drawQr, decodeCanvas, QrScanner } from './qr.js';
 
-export const VERSION = '1.0.0';
+export const VERSION = '1.1.0';
+const APP_URL = 'https://insaned19414.github.io/hydra-sentinel-live/';
+// Absolute https deep link: the iOS Camera app opens it straight into Sentinel. Payload rides in the #fragment (never sent to the server).
+function pairLink(payload) { const base = location.protocol === 'https:' ? location.origin + location.pathname : APP_URL; return base + '#p=' + encodeURIComponent(payload); }
+function extractPayload(text) { text = (text || '').trim(); const m = /[#?&]p(?:air)?=([^&#\s]+)/.exec(text); return m ? decodeURIComponent(m[1]) : text; }
 const RETRY_DELAYS = [1, 2, 5, 10, 20, 30];   // seconds, per spec
 const STALE_MS = 3000;
 const PAIR_TTL_MS = 5 * 60 * 1000;
@@ -118,8 +122,9 @@ async function openPair() {
   const b = S.settings.broker; const custom = JSON.stringify(b) !== JSON.stringify(DEFAULT_BROKER);
   const payload = await encodePayload('HAIL1P', { v: 1, cc: S.id, n: deviceName(), tok, exp, ...(custom ? { br: b } : {}) });
   S.pairPayload = payload;
-  const info = drawQr($('#pairQr'), payload, 'M');
-  $('#pairQr').dataset.payload = payload; $('#pairQr').dataset.version = info.version;
+  const link = pairLink(payload); S.pairLink = link;
+  const info = drawQr($('#pairQr'), link, 'M');
+  $('#pairQr').dataset.payload = link; $('#pairQr').dataset.version = info.version;
   $('#pairStatus').textContent = S.broker && S.broker.status === 'online' ? 'Single-use code. Waiting for the station to approve…' : 'Broker is offline. Pairing needs the broker, or use offline pairing.';
   countdown($('#pairCountdown'), exp, () => { $('#pairStatus').textContent = 'Code expired. Tap New code.'; $('#pairQr').style.opacity = .15; });
   $('#pairQr').style.opacity = 1;
@@ -581,7 +586,8 @@ function stopScanner() { if (scanner) scanner.stop(); scanner = null; }
 export async function handleScan(text) {
   stopScanner();
   let p;
-  try { p = await decodePayload(text); } catch { toast('That is not a Sentinel code'); return back(); }
+  try { p = await decodePayload(extractPayload(text)); } catch { toast('That is not a Sentinel code'); return back(); }
+  if (!S.settings.role && (p.kind === 'HAIL1P' || p.kind === 'HAIL1O')) applyRole('station');
   const role = S.settings.role;
   if (role === 'station' && (p.kind === 'HAIL1P' || p.kind === 'HAIL1O')) return stHandleInvite(p.kind, p.data);
   if (role === 'command' && p.kind === 'HAIL1A') { S.history = ['home']; return ccHandleAnswer(p.data); }
@@ -687,6 +693,7 @@ function wire() {
   $('#liveBtn').onclick = onLiveButton;
   $('#homePair').onclick = openPair; $('#stationsPair').onclick = openPair;
   $('#pairRefresh').onclick = () => { S.history.pop(); openPair(); };
+  $('#pairShare').onclick = () => { const l = S.pairLink; if (!l) return; if (navigator.share) navigator.share({ title: 'Pair Sentinel', url: l }).catch(() => { }); else navigator.clipboard.writeText(l).then(() => toast('Pairing link copied')); };
   $('#pairUseOffline').onclick = () => openOffline();
   $('#addStation').onclick = () => { const n = prompt('Station name', 'Front Door'); if (n) { Store.upsertStation({ id: 'st-' + randomId(4), name: n, deviceId: null, created: Date.now() }); renderStations(); render(); } };
   $('#scanAnswer').onclick = () => openScanner('Scan the answer code shown on the camera station.');
@@ -731,6 +738,8 @@ function wire() {
   });
 }
 function handleDeepLink() {
+  const hp = /[#&]p=([^&]+)/.exec(location.hash);
+  if (hp) { history.replaceState(null, '', location.pathname); const code = decodeURIComponent(hp[1]); setTimeout(() => handleScan(code), 300); return; }
   const q = new URLSearchParams(location.search);
   const role = q.get('role'), action = q.get('action');
   if (role === 'station' || role === 'command') { if (S.settings.role !== role) applyRole(role); }
@@ -751,6 +760,7 @@ async function boot() {
   if (S.settings.role === 'command') show('home', false);
   else if (S.settings.role === 'station') show('stationHome', false);
   else show('role', false);
+  setTimeout(() => { const sp = document.getElementById('splash'); if (sp) { sp.classList.add('hide'); setTimeout(() => sp.remove(), 600); } }, 900);
   handleDeepLink();
   if (S.settings.role && !S.broker) startBroker();
   render();

@@ -25,6 +25,7 @@
 <script type="module" src="js/app.js"></script>
 </head>
 <body>
+<div id="splash" aria-hidden="true"><img src="img/banner.jpg" alt=""></div>
 
 <!-- ROLE PICKER -->
 <section id="role" class="screen">
@@ -55,11 +56,12 @@
 
 <!-- PAIR (command center shows QR) -->
 <section id="pair" class="screen">
-  <div class="topbar"><button class="btn icon ghost" data-back>&#8249;</button><h2>Pair a station</h2></div>
-  <p class="muted small">On the spare iPhone: open Sentinel, choose <b>Camera Station</b>, tap <b>Pair with command center</b> and scan this code. The station must tap <b>Approve</b>.</p>
+  <div class="topbar"><button class="btn icon ghost" data-back>&#8249;</button><h2 class="grow">Pair a station</h2><img src="img/crest-256.png" class="toplogo" alt=""></div>
+  <p class="muted small">On the other iPhone or iPad: point the regular <b>Camera</b> app at this code and tap the Sentinel link (or use <b>Pair with command center</b> inside Sentinel). Then tap <b>Approve</b> on that device.</p>
   <div class="qrbox"><canvas id="pairQr" aria-label="Pairing QR code"></canvas></div>
   <div id="pairCountdown" class="countdown">5:00</div>
   <p id="pairStatus" class="center muted small">Single-use code. Expires in 5 minutes.</p>
+  <button class="btn block gold" id="pairShare">Share pairing link (AirDrop / Messages)</button>
   <button class="btn block" id="pairRefresh">New code</button>
   <button class="btn block ghost" id="pairUseOffline">No internet? Use offline pairing</button>
 </section>
