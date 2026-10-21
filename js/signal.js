@@ -22,9 +22,17 @@ export class Broker extends EventTarget {
       this.peer.on('open', () => { clearTimeout(t); this.setStatus('online'); res(this); });
       this.peer.on('connection', conn => this.emit('connection', conn));
       this.peer.on('disconnected', () => {
+        // Lost the broker websocket (Wi-Fi change, sleep). Keep the same ID and retry with backoff; media sessions are unaffected.
         this.setStatus('reconnecting');
-        setTimeout(() => { if (this.peer && !this.peer.destroyed && this.peer.disconnected) try { this.peer.reconnect(); } catch { } }, 2000);
+        let n = 0; clearTimeout(this.rt);
+        const retry = () => {
+          if (!this.peer || this.peer.destroyed || !this.peer.disconnected) return;
+          if (navigator.onLine !== false) try { this.peer.reconnect(); } catch { }
+          this.rt = setTimeout(retry, Math.min(30000, 2000 * 2 ** n++));
+        };
+        this.rt = setTimeout(retry, 1500);
       });
+      this.peer.on('open', () => { clearTimeout(this.rt); if (this.status !== 'online') this.setStatus('online'); });
       this.peer.on('error', err => {
         if (err && err.type === 'peer-unavailable') {
           const m = /peer (\S+)/.exec(err.message || ''); const id = m && m[1];
@@ -47,7 +55,9 @@ export class Broker extends EventTarget {
       conn.on('error', e => done(false, e));
     });
   }
-  destroy() { if (this.peer) try { this.peer.destroy(); } catch { } this.peer = null; this.setStatus('idle'); }
+  // Called on 'online' / app return: nudge an idle socket instead of waiting for the backoff timer.
+  nudge() { if (this.peer && !this.peer.destroyed && this.peer.disconnected) try { this.peer.reconnect(); } catch { } }
+  destroy() { clearTimeout(this.rt); if (this.peer) try { this.peer.destroy(); } catch { } this.peer = null; this.setStatus('idle'); }
 }
 
 // Wait for one message of a given type on a PeerJS DataConnection.

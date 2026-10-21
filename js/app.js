@@ -4,8 +4,12 @@ import { encodePayload, decodePayload } from './codec.js';
 import { MediaSession, iceServersFrom, cameraConstraints } from './rtc.js';
 import { Broker, waitFor, DEFAULT_BROKER } from './signal.js';
 import { drawQr, decodeCanvas, QrScanner } from './qr.js';
+import { nextDelay, makeCode, normalizeCode, formatCode, codePeerId, feedState } from './backoff.js';
+import { Wake, iosVersion } from './wake.js';
+import { Guard, hashPin } from './guard.js';
+import { beep, buzz, unlockAudio, MotionProbe } from './alerts.js';
 
-export const VERSION = '1.1.0';
+export const VERSION = '2.0.0';
 const APP_URL = 'https://insaned19414.github.io/hydra-sentinel-live/';
 // Absolute https deep link: the iOS Camera app opens it straight into Sentinel. Payload rides in the #fragment (never sent to the server).
 function pairLink(payload) { const base = location.protocol === 'https:' ? location.origin + location.pathname : APP_URL; return base + '#p=' + encodeURIComponent(payload); }
@@ -29,6 +33,12 @@ const S = {
   station: { active: false, cam: null, sessions: new Set(), wake: null },
   offline: null,         // pending offline exchange
   pairTimer: null, history: [],
+  feeds: new Map(),      // stationId -> feed (command center)
+  monitor: false,        // monitor grid open
+  alerts: [], wake: new Wake(), guard: null, brokerAttempt: 0, brokerP: null,
+};
+const ICON = {
+  full: '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg>',
 };
 
 // ---------- UI helpers ----------
@@ -71,11 +81,28 @@ async function startBroker() {
   setBrokerChips('idle');
   if (S.settings.signaling !== 'peerjs') return null;
   const b = new Broker(S.settings, S.id, iceServersFrom(S.settings));
-  b.addEventListener('status', e => { setBrokerChips(e.detail.status); if (e.detail.status === 'online' && S.settings.role === 'command') pollAll(); });
+  b.addEventListener('status', e => {
+    const st = e.detail.status; setBrokerChips(st);
+    if (S.broker !== b) return;
+    if (st === 'online') { S.brokerAttempt = 0; clearTimeout(S.brokerT); if (S.settings.role === 'command') { pollAll(); for (const F of S.feeds.values()) if (!F.session && !F.connecting) retryNow(F, false); } }
+    if (st === 'error' && e.detail.info !== 'peer-unavailable') { // self-heal: rebuild the broker connection with backoff
+      clearTimeout(S.brokerT); const d = nextDelay(S.brokerAttempt++);
+      S.brokerT = setTimeout(() => { if (S.broker === b && b.status === 'error') ensureBroker(true); }, d);
+    }
+  });
   b.addEventListener('connection', e => S.settings.role === 'command' ? ccIncoming(e.detail) : stIncoming(e.detail));
   S.broker = b;
-  try { await b.start(); } catch (e) { console.warn('broker', e); }
+  try { await b.start(); } catch (e) { console.warn('broker', e && (e.type || e.message)); }
   return b;
+}
+// Single-flight broker start: many feeds can ask at once without tearing each other's connection down.
+async function ensureBroker(force = false) {
+  if (S.settings.signaling !== 'peerjs') return null;
+  if (!force && S.broker && S.broker.status === 'online') return S.broker;
+  if (S.brokerP) return S.brokerP;
+  if (!force && S.broker && S.broker.status === 'reconnecting') { S.broker.nudge(); await sleep(2500); if (S.broker && S.broker.status === 'online') return S.broker; }
+  S.brokerP = startBroker().finally(() => { S.brokerP = null; });
+  return S.brokerP;
 }
 
 // =====================================================================
@@ -125,9 +152,43 @@ async function openPair() {
   const link = pairLink(payload); S.pairLink = link;
   const info = drawQr($('#pairQr'), link, 'M');
   $('#pairQr').dataset.payload = link; $('#pairQr').dataset.version = info.version;
+  startPairCode(payload, exp);
   $('#pairStatus').textContent = S.broker && S.broker.status === 'online' ? 'Single-use code. Waiting for the station to approve…' : 'Broker is offline. Pairing needs the broker, or use offline pairing.';
   countdown($('#pairCountdown'), exp, () => { $('#pairStatus').textContent = 'Code expired. Tap New code.'; $('#pairQr').style.opacity = .15; });
   $('#pairQr').style.opacity = 1;
+}
+// Short typed code: the command center listens on a throwaway broker ID derived from the code and hands the
+// one-time invite to whoever connects (max 3 times, 5 min). The station still has to tap Approve, and the
+// token inside the invite is single-use, so the code only shortens typing; it adds no new trust.
+let pairCodePeer = null;
+async function startPairCode(payload, exp, tries = 0) {
+  stopPairCode();
+  $('#pairCode').textContent = '······'; $('#pairCodeWrap').hidden = S.settings.signaling !== 'peerjs';
+  if (S.settings.signaling !== 'peerjs') return;
+  const code = makeCode(); let given = 0;
+  const b = new Broker(S.settings, codePeerId(code), iceServersFrom(S.settings)); pairCodePeer = b;
+  b.addEventListener('connection', e => {
+    const conn = e.detail;
+    conn.on('open', () => { if (given < 3 && Date.now() < exp) { given++; conn.send({ t: 'invite', payload }); } else conn.send({ t: 'invite-expired' }); setTimeout(() => { try { conn.close(); } catch { } }, 3000); });
+  });
+  try { await b.start(12000); if (pairCodePeer !== b) return b.destroy(); $('#pairCode').textContent = formatCode(code); S.pairCode = code; window.SentinelDebug.pairCode = code; }
+  catch (e) { if (pairCodePeer === b) { b.destroy(); pairCodePeer = null; if (tries < 2 && $('#pair').classList.contains('active')) return startPairCode(payload, exp, tries + 1); $('#pairCode').textContent = 'n/a'; } }
+}
+function stopPairCode() { if (pairCodePeer) { pairCodePeer.destroy(); pairCodePeer = null; } S.pairCode = null; }
+async function joinByCode(raw) {
+  const code = normalizeCode(raw);
+  if (!code) return toast('Enter the 6-character code shown on the command center');
+  $('#codeJoin').disabled = true; $('#codeJoin').textContent = 'Connecting…';
+  try {
+    await ensureBroker();
+    if (!S.broker || S.broker.status !== 'online') throw new Error('Broker offline. Check internet, or use the QR code.');
+    const conn = await S.broker.connect(codePeerId(code), 9000);
+    const m = await waitFor(conn, ['invite', 'invite-expired'], 6000); try { conn.close(); } catch { }
+    if (m.t !== 'invite') throw new Error('That code has expired. Tap New code on the command center.');
+    $('#codeInput').value = '';
+    await handleScan(m.payload);
+  } catch (e) { toast(/unreachable|timeout/i.test(e.message) ? 'Code not found. Check it on the command center (codes last 5 minutes).' : e.message, 4200); }
+  finally { $('#codeJoin').disabled = false; $('#codeJoin').textContent = 'Pair with code'; }
 }
 function consumeToken(tok) {
   const now = Date.now(); const list = Store.pendingTokens();
@@ -154,11 +215,12 @@ function ccIncoming(conn) {
       if (r !== 'ok') { conn.send({ t: 'pair-fail', reason: r }); return; }
       addPairedDevice({ id: msg.id, n: msg.n || 'Camera Station', secret: msg.secret, mode: 'peerjs', pairedAt: Date.now() });
       conn.send({ t: 'pair-ok', cc: S.id, n: deviceName() });
-      clearInterval(S.pairTimer);
-      toast(`${msg.n || 'Station'} paired`);
+      clearInterval(S.pairTimer); stopPairCode();
+      toast(`${msg.n || 'Station'} paired · connecting to it now`, 3500);
       const st = Store.stations().find(s => s.deviceId === msg.id);
-      if (st) setHealth(st.id, 'live');
-      if ($('#pair').classList.contains('active')) { S.history = ['home']; show('stations', false); }
+      if (st) setHealth(st.id, 'reconnecting');
+      // One-tap: jump straight into the live view; it keeps retrying until the station's camera is on.
+      if ($('#pair').classList.contains('active') && st) { S.history = ['home']; startLive(st.id); }
       render();
     } else if (msg.t === 'pair-deny') {
       consumeToken(msg.tok); $('#pairStatus').textContent = 'The station denied pairing.'; toast('Station denied pairing');
@@ -170,7 +232,7 @@ function ccIncoming(conn) {
 async function pingStation(st) {
   const dev = Store.devices().find(d => d.id === st.deviceId);
   if (!dev || dev.mode !== 'peerjs' || !S.broker || S.broker.status !== 'online') return false;
-  if (S.live && S.live.stationId === st.id) return true;
+  if (S.feeds.has(st.id)) return true; // an open feed is its own health check
   let conn;
   try {
     conn = await S.broker.connect(dev.id, 8000);
@@ -228,155 +290,323 @@ async function ccHandleAnswer(data) {
   startLive(st.id, session);
 }
 
-// ----- live view -----
-async function startLive(stationId, offlineSession = null) {
-  stopLive(true);
-  const st = Store.stations().find(s => s.id === stationId);
-  if (!st) return;
-  Store.upsertStation({ id: st.id, lastSelected: Date.now() });
-  S.live = { stationId, attempt: 0, session: null, conn: null, lastFrame: 0, frames: 0, recorder: null, listen: false, offline: !!offlineSession };
-  $('#liveTitle').textContent = st.name;
-  $('#liveVideo').srcObject = null;
-  setBadge('wait', 'CONNECTING'); $('#liveMsg').textContent = 'CONNECTING…'; $('#liveMsg').hidden = false;
-  $('#staleOverlay').classList.remove('show');
-  const dev = Store.devices().find(d => d.id === st.deviceId);
-  if (!offlineSession && (S.settings.signaling === 'offline' || (dev && dev.mode === 'offline'))) { S.live = null; return openOffline(stationId); }
-  renderStrip();
-  show('live');
-  startFrameMonitor();
-  if (offlineSession) return attachSession(offlineSession);
-  connectLive();
+// ----- feeds: one auto-reconnecting WebRTC session per station; the live view focuses one, the monitor grid shows all -----
+const HB_MS = 2000, HB_DEAD_MS = 8000, OFFLINE_AFTER = 6, OFFLINE_ALERT_MS = 10000, MOTION_COOLDOWN_MS = 30000;
+const MOTION_TH = { low: 0.12, medium: 0.06, high: 0.03 };
+function devFor(stationId) { const st = Store.stations().find(s => s.id === stationId); return st && Store.devices().find(d => d.id === st.deviceId); }
+function openFeed(stationId, offlineSession = null) {
+  let F = S.feeds.get(stationId);
+  if (F && !offlineSession) { if (!F.session && !F.connecting && !F.retryT && !F.denied) connectFeed(F); return F; }
+  if (F) closeFeed(stationId);
+  F = { stationId, attempt: 0, session: null, conn: null, lastFrame: 0, frames: 0, framesDecoded: -1, rtt: null, hbRtt: null, lastHbAck: 0, hbSupported: false,
+    offline: !!offlineSession, probe: new MotionProbe(), motionAt: 0, downSince: 0, wasLive: false, alerted: false, recorder: null, listen: false, iceRestarts: 0, opened: Date.now() };
+  S.feeds.set(stationId, F);
+  Store.upsertStation({ id: stationId, lastSelected: Date.now() });
+  if (offlineSession) attachSession(F, offlineSession); else { setHealth(stationId, 'reconnecting', { retry: 0 }); connectFeed(F); }
+  updateWake(); renderGrid();
+  return F;
 }
-async function connectLive() {
-  const L = S.live; if (!L) return;
-  const st = Store.stations().find(s => s.id === L.stationId);
-  const dev = st && Store.devices().find(d => d.id === st.deviceId);
-  if (!dev) { $('#liveMsg').textContent = 'No device assigned to this station.'; return; }
-  if (dev.mode === 'offline') { const id = L.stationId; S.live = null; stopFrameMonitor(); return openOffline(id); }
+function closeFeed(stationId) {
+  const F = S.feeds.get(stationId); if (!F) return;
+  F.closing = true;
+  if (F.recorder) stopRecording(F);
+  clearTimeout(F.retryT); clearTimeout(F.discT);
+  if (F.session) F.session.close();
+  if (F.conn) try { F.conn.close(); } catch { }
+  S.feeds.delete(stationId);
+  if (S.live === F) { S.live = null; $('#liveVideo').srcObject = null; $('#liveVideo')._feed = null; }
+  if (health(stationId).state !== 'offline') setHealth(stationId, 'offline', { retry: 0 });
+  updateWake(); renderGrid();
+}
+function closeAllFeeds() { for (const id of Array.from(S.feeds.keys())) closeFeed(id); }
+async function connectFeed(F) {
+  if (S.feeds.get(F.stationId) !== F || F.connecting) return;
+  const dev = devFor(F.stationId);
+  if (!dev) { F.note = 'No device assigned to this station.'; setHealth(F.stationId, 'offline'); return; }
+  if (dev.mode === 'offline') { F.note = 'Offline-QR device: tap to exchange codes'; F.offline = true; setHealth(F.stationId, 'offline'); return; }
+  F.connecting = true; F.note = ''; health(F.stationId).note = '';
   try {
-    if (!S.broker || S.broker.status !== 'online') await startBroker();
+    if (navigator.onLine === false) throw new Error('No internet');
+    await ensureBroker();
     if (!S.broker || S.broker.status !== 'online') throw new Error('Broker offline');
     const conn = await S.broker.connect(dev.id, 9000);
-    if (S.live !== L) { conn.close(); return; }
-    L.conn = conn;
+    if (S.feeds.get(F.stationId) !== F) { conn.close(); return; }
+    F.conn = conn;
     conn.send({ t: 'hello', cc: S.id, secret: dev.secret, n: deviceName() });
     const h = await waitFor(conn, ['hello-ok', 'denied', 'not-active'], 8000);
-    if (h.t === 'denied') { $('#liveMsg').textContent = 'Station refused this command center. Pair again.'; setHealth(L.stationId, 'offline'); return; }
-    if (h.t === 'not-active') { $('#liveMsg').textContent = 'Station app is open but not started. Tap START STATION on it.'; setHealth(L.stationId, 'stale'); throw new Error('not active'); }
+    if (h.t === 'denied') { F.denied = true; F.note = 'Station refused this command center. Pair again.'; setHealth(F.stationId, 'offline', { note: F.note }); return; }
+    if (h.t === 'not-active') { F.note = 'Station app is open but not started. Tap START STATION on it.'; setHealth(F.stationId, 'stale', { note: F.note }); throw new Error('not active'); }
     const session = new MediaSession('viewer', S.settings);
     const sdp = await session.createOffer();
     conn.send({ t: 'offer', sid: session.sid, sdp });
-    const ans = await waitFor(conn, 'answer', 15000);
+    const ans = await waitFor(conn, ['answer', 'error'], 15000);
+    if (ans.t === 'error') { session.close(); throw new Error('Station error: ' + ans.error); }
     if (ans.sid !== session.sid) throw new Error('stale answer');
     await session.acceptAnswer(ans.sdp);
-    conn.on('close', () => { if (S.live === L && L.session === session && session.state !== 'connected') scheduleReconnect('signal closed'); });
-    attachSession(session);
+    conn.on('close', () => { if (S.feeds.get(F.stationId) === F && F.session === session && session.state !== 'connected' && !F.restarting) scheduleReconnect(F, 'signal closed'); });
+    attachSession(F, session);
   } catch (e) {
-    console.warn('connectLive', e);
-    if (S.live === L) scheduleReconnect(e.message);
+    console.warn('connectFeed', e && e.message);
+    if (S.feeds.get(F.stationId) === F) scheduleReconnect(F, e.message);
+  } finally { F.connecting = false; }
+}
+function attachVideo(v, F) {
+  v._feed = F;
+  const stream = F && F.session ? F.session.remoteStream : null;
+  if (v.srcObject !== stream) v.srcObject = stream;
+  if (stream) v.play().catch(() => { });
+  if (!v._rvfc && 'requestVideoFrameCallback' in HTMLVideoElement.prototype) {
+    v._rvfc = true;
+    const cb = () => { const f = v._feed; if (f && v.srcObject) { f.lastFrame = Date.now(); f.frames++; } v.requestVideoFrameCallback(cb); };
+    v.requestVideoFrameCallback(cb);
   }
 }
-function attachSession(session) {
-  const L = S.live; if (!L) return session.close();
-  L.session = session;
-  const v = $('#liveVideo');
-  v.srcObject = session.remoteStream; v.muted = !L.listen;
-  v.play().catch(() => { });
+function attachSession(F, session) {
+  if (S.feeds.get(F.stationId) !== F) return session.close();
+  F.session = session; F.lastHbAck = Date.now();
+  const tile = tileFor(F.stationId); if (tile) attachVideo(tile.querySelector('video'), F);
+  if (S.live === F) { const v = $('#liveVideo'); attachVideo(v, F); v.muted = !F.listen; window.SentinelDebug.session = session; }
   session.addEventListener('message', e => {
     const m = e.detail;
-    if (m.t === 'camera') toast('Station camera: ' + (m.facing === 'user' ? 'front' : 'back'));
-    if (m.t === 'bye') scheduleReconnect('station ended session');
+    if (m.t === 'hb-ack') { F.hbSupported = true; F.lastHbAck = Date.now(); F.hbRtt = Math.round(performance.now() - m.ts); }
+    if (m.t === 'camera' && S.live === F) toast('Station camera: ' + (m.facing === 'user' ? 'front' : 'back'));
+    if (m.t === 'bye') scheduleReconnect(F, 'station ended session');
   });
-  let discT;
   session.addEventListener('state', e => {
     const s = e.detail;
-    if (S.live !== L || L.session !== session) return;
-    if (s === 'connected') { L.attempt = 0; clearTimeout(discT); $('#liveMsg').hidden = true; setHealth(L.stationId, 'live', { retry: 0 }); }
-    else if (s === 'failed' || s === 'closed') scheduleReconnect('connection ' + s);
-    else if (s === 'disconnected') { clearTimeout(discT); discT = setTimeout(() => { if (session.state === 'disconnected') scheduleReconnect('disconnected'); }, 4000); }
+    if (S.feeds.get(F.stationId) !== F || F.session !== session) return;
+    if (s === 'connected') { F.attempt = 0; F.restarting = false; F.note = ''; clearTimeout(F.discT); F.lastHbAck = Date.now(); Object.assign(health(F.stationId), { retry: 0, note: '' }); Store.upsertDevice({ id: devFor(F.stationId)?.id, lastConnected: Date.now() }); }
+    else if (s === 'failed') tryIceRestart(F, session, 'failed');
+    else if (s === 'closed') scheduleReconnect(F, 'closed');
+    else if (s === 'disconnected') { clearTimeout(F.discT); F.discT = setTimeout(() => { if (session.state === 'disconnected') tryIceRestart(F, session, 'disconnected'); }, 2500); }
   });
-  window.SentinelDebug.session = session;
+  window.SentinelDebug.session = window.SentinelDebug.session || session;
+  renderGrid();
 }
-function scheduleReconnect(reason) {
-  const L = S.live; if (!L || L.closing) return;
-  if (L.recorder) stopRecording();
-  if (L.session) { const s = L.session; L.session = null; s.close(); }
-  if (L.conn) { try { L.conn.close(); } catch { } L.conn = null; }
-  clearTimeout(L.retryT);
-  if (L.offline) {
-    setHealth(L.stationId, 'offline'); setBadge('wait', 'ENDED');
-    $('#liveMsg').hidden = false; $('#liveMsg').innerHTML = 'Session ended. Offline mode needs a new QR exchange.<br><br><button class="btn gold" id="liveRedo">New QR exchange</button>';
-    $('#liveRedo').onclick = () => { const id = L.stationId; stopLive(); openOffline(id); };
-    return;
-  }
-  if (L.attempt >= RETRY_DELAYS.length) {
-    setHealth(L.stationId, 'offline'); setBadge('wait', 'OFFLINE');
-    $('#liveMsg').hidden = false; $('#liveMsg').innerHTML = 'Station offline.<br><br><button class="btn gold" id="liveRetry">Retry</button> <button class="btn" id="liveLast">View last status</button>';
-    $('#liveRetry').onclick = () => { L.attempt = 0; connectLive(); };
-    $('#liveLast').onclick = () => { stopLive(); openStatus(); };
-    return;
-  }
-  const d = RETRY_DELAYS[L.attempt++];
-  setHealth(L.stationId, 'reconnecting', { retry: L.attempt });
-  setBadge('wait', 'RECONNECTING');
-  $('#liveMsg').hidden = false; $('#liveMsg').textContent = `RECONNECTING · attempt ${L.attempt}/${RETRY_DELAYS.length} in ${d}s`;
-  L.retryT = setTimeout(() => { if (S.live === L) connectLive(); }, d * 1000);
-  L.lastReason = reason;
+// ICE restart keeps the same session (new network path, e.g. Wi-Fi -> cellular). Falls back to a fresh session.
+async function tryIceRestart(F, session, why) {
+  if (F.restarting || F.session !== session) return;
+  if (F.offline || !F.conn || F.conn.open === false) return scheduleReconnect(F, why);
+  F.restarting = true; F.iceRestarts++;
+  setHealth(F.stationId, 'reconnecting', { retry: F.attempt });
+  try {
+    const sdp = await session.createRestartOffer();
+    F.conn.send({ t: 'offer', sid: session.sid, sdp, restart: true });
+    const ans = await waitFor(F.conn, ['answer', 'error'], 10000);
+    if (ans.t === 'error') throw new Error(ans.error);
+    await session.acceptAnswer(ans.sdp);
+    const ok = await new Promise(res => { if (session.state === 'connected') return res(true); const t = setTimeout(() => res(false), 7000); session.addEventListener('state', function h(e) { if (e.detail === 'connected') { clearTimeout(t); session.removeEventListener('state', h); res(true); } }); });
+    F.restarting = false;
+    if (!ok) scheduleReconnect(F, 'ice restart timed out');
+  } catch (e) { F.restarting = false; scheduleReconnect(F, 'ice restart: ' + e.message); }
 }
-function stopLive(silent) {
-  const L = S.live; if (!L) return;
-  L.closing = true;
-  if (L.recorder) stopRecording();
-  clearTimeout(L.retryT);
-  if (L.session) L.session.close();
-  if (L.conn) try { L.conn.close(); } catch { }
-  stopFrameMonitor();
-  $('#liveVideo').srcObject = null;
-  S.live = null;
-  if (!silent) { show(S.settings.role === 'station' ? 'stationHome' : 'home', false); S.history = []; render(); setTimeout(pollAll, 1500); }
+function scheduleReconnect(F, reason) {
+  if (S.feeds.get(F.stationId) !== F || F.closing) return;
+  if (F.recorder) stopRecording(F);
+  if (F.session) { const s = F.session; F.session = null; s.close(); }
+  if (F.conn) { try { F.conn.close(); } catch { } F.conn = null; }
+  clearTimeout(F.retryT); F.retryT = null; F.restarting = false;
+  F.lastReason = reason;
+  if (F.offline) { F.note = 'Session ended. Offline mode needs a new QR exchange.'; setHealth(F.stationId, 'offline'); renderGrid(); return; }
+  if (F.denied) return;
+  const d = nextDelay(F.attempt); F.attempt++;
+  F.nextAt = Date.now() + d;
+  setHealth(F.stationId, F.attempt > OFFLINE_AFTER ? 'offline' : 'reconnecting', { retry: F.attempt });
+  F.retryT = setTimeout(() => { F.retryT = null; connectFeed(F); }, d);
+}
+function retryNow(F, resetAttempts = true) {
+  if (!F || F.connecting || (F.session && F.session.state === 'connected')) return;
+  if (F.offline) return openOffline(F.stationId);
+  clearTimeout(F.retryT); F.retryT = null; F.denied = false; if (resetAttempts) F.attempt = 0;
+  connectFeed(F);
+}
+// Network came back / app returned to the foreground: reconnect now instead of waiting out the backoff.
+function reconnectEverything(why) {
+  if (S.broker) S.broker.nudge();
+  if (S.settings.signaling === 'peerjs' && (!S.broker || S.broker.status === 'error' || S.broker.status === 'idle')) ensureBroker();
+  for (const F of S.feeds.values()) {
+    if (F.session && F.session.state === 'connected') { if (F.hbSupported && Date.now() - F.lastHbAck > HB_DEAD_MS) tryIceRestart(F, F.session, why); continue; }
+    if (!F.offline && !F.denied) retryNow(F);
+  }
+  if (S.settings.role === 'command') setTimeout(pollAll, 1500);
+}
+// Heartbeat over the data channel: proves the path end-to-end and measures round trip.
+function heartbeat() {
+  for (const F of S.feeds.values()) {
+    const s = F.session; if (!s) continue;
+    s.send({ t: 'hb', ts: performance.now() });
+    if (s.state === 'connected' && F.hbSupported && Date.now() - F.lastHbAck > HB_DEAD_MS) tryIceRestart(F, s, 'heartbeat lost');
+  }
+}
+setInterval(heartbeat, HB_MS);
+
+// ----- focused live view (fullscreen of one feed) -----
+async function startLive(stationId, offlineSession = null) {
+  const st = Store.stations().find(s => s.id === stationId);
+  if (!st) return;
+  const dev = devFor(stationId);
+  const existing = S.feeds.get(stationId);
+  if (!offlineSession && (S.settings.signaling === 'offline' || (dev && dev.mode === 'offline')) && !(existing && existing.session)) return openOffline(stationId);
+  const prev = S.live;
+  if (prev && prev.stationId !== stationId && !S.monitor) closeFeed(prev.stationId);
+  const F = openFeed(stationId, offlineSession);
+  focusFeed(F);
+}
+function focusFeed(F) {
+  const st = Store.stations().find(s => s.id === F.stationId);
+  S.live = F;
+  $('#liveTitle').textContent = st ? st.name : 'Station';
+  const v = $('#liveVideo'); attachVideo(v, F); v.muted = !F.listen;
+  $('#btnListen').classList.toggle('on', !!F.listen);
+  $('#btnRecord').classList.toggle('rec-on', !!F.recorder); $('#recBadge').hidden = !F.recorder;
+  if (F.session) window.SentinelDebug.session = F.session;
+  renderStrip(); show('live'); paintFocused();
+}
+function stopLive() {
+  const F = S.live; if (!F) { show(S.monitor ? 'monitor' : 'home', false); return; }
+  S.live = null; $('#liveVideo').srcObject = null; $('#liveVideo')._feed = null;
+  if (F.recorder) stopRecording(F);
+  if (S.monitor) { show('monitor', false); renderGrid(); return; }
+  closeFeed(F.stationId);
+  show(S.settings.role === 'station' ? 'stationHome' : 'home', false); S.history = []; render(); setTimeout(pollAll, 1500);
 }
 function setBadge(cls, text) { const b = $('#liveBadge'); b.className = 'badge ' + cls; b.textContent = text; }
 
-// STALE detection: requestVideoFrameCallback (Safari 15.4+, Chrome 83+), with getStats framesDecoded and
-// currentTime polling as fallbacks. A frozen frame is never labelled LIVE.
-let monT, rvfcOn = false;
-function startFrameMonitor() {
-  const v = $('#liveVideo'); stopFrameMonitor();
-  let lastCT = 0, lastDecoded = -1;
-  if ('requestVideoFrameCallback' in HTMLVideoElement.prototype) {
-    rvfcOn = true;
-    const cb = (now, meta) => { if (!rvfcOn) return; if (S.live) { S.live.lastFrame = performance.now(); S.live.frames++; } v.requestVideoFrameCallback(cb); };
-    v.requestVideoFrameCallback(cb);
-  }
-  let snapAt = 0;
-  monT = setInterval(async () => {
-    const L = S.live; if (!L) return;
-    if (!rvfcOn && v.currentTime !== lastCT && v.videoWidth) { lastCT = v.currentTime; L.lastFrame = performance.now(); L.frames++; }
-    if (L.session && L.session.videoTx) {
-      try {
-        const st = await L.session.videoTx.receiver.getStats();
-        st.forEach(r => { if (r.type === 'inbound-rtp' && r.kind === 'video') { if (lastDecoded >= 0 && r.framesDecoded > lastDecoded && !rvfcOn) L.lastFrame = performance.now(); lastDecoded = r.framesDecoded; L.framesDecoded = r.framesDecoded; } });
-      } catch { }
-    }
-    const age = L.lastFrame ? performance.now() - L.lastFrame : Infinity;
-    const stale = L.frames > 0 && age >= STALE_MS;
-    $('#staleOverlay').classList.toggle('show', stale);
-    if (stale) {
-      $('#staleInfo').textContent = `No new frames for ${Math.floor(age / 1000)}s`;
-      setBadge('stale', 'STALE'); if (health(L.stationId).state === 'live') setHealth(L.stationId, 'stale');
-    } else if (L.frames > 0 && L.session && L.session.state === 'connected') {
-      setBadge('live', 'LIVE'); $('#liveMsg').hidden = true; if (health(L.stationId).state !== 'live') setHealth(L.stationId, 'live');
-      if (Date.now() - snapAt > 10000) { snapAt = Date.now(); snapshot(L.stationId); }
-    }
-    if (L.recorder) $('#recTime').textContent = fmtDur(Date.now() - L.recStart);
-  }, 500);
+// ----- monitor grid -----
+function openMonitor() {
+  S.monitor = true; S.history = ['home']; show('monitor', false);
+  assigned().forEach(st => openFeed(st.id));
+  renderGrid(); updateWake();
 }
-function stopFrameMonitor() { rvfcOn = false; clearInterval(monT); }
-function snapshot(stationId) {
-  const v = $('#liveVideo'); if (!v.videoWidth) return;
+function leaveMonitor() { S.monitor = false; closeAllFeeds(); show('home', false); S.history = []; render(); setTimeout(pollAll, 1500); }
+function tileFor(stId) { return document.querySelector(`#grid .tile[data-st="${CSS.escape(stId)}"]`); }
+function renderGrid() {
+  const grid = $('#grid'); if (!grid) return;
+  const list = S.monitor ? Store.stations() : [];
+  const want = new Set(list.map(s => s.id));
+  grid.querySelectorAll('.tile').forEach(t => { if (!want.has(t.dataset.st)) t.remove(); });
+  for (const st of list) {
+    let t = tileFor(st.id);
+    if (!t) {
+      t = document.createElement('div'); t.className = 'tile'; t.dataset.st = st.id;
+      t.innerHTML = `<video playsinline autoplay muted></video><div class="t-top"><span class="t-name"></span><span class="t-chip"></span></div><div class="t-msg"></div><div class="t-bot"><span class="t-info mono"></span><button class="btn icon t-act"></button><button class="btn icon ghost t-full" aria-label="Fullscreen">${ICON.full}</button></div>`;
+      t.querySelector('video').addEventListener('click', () => { const F = S.feeds.get(st.id); if (F && F.session) focusFeed(F); else if (F && F.offline) openOffline(st.id); else if (F) retryNow(F); });
+      t.querySelector('.t-full').onclick = () => { const F = S.feeds.get(st.id) || openFeed(st.id); focusFeed(F); };
+      t.querySelector('.t-act').onclick = () => { const F = S.feeds.get(st.id); if (F) closeFeed(st.id); else openFeed(st.id); };
+      grid.appendChild(t);
+    }
+    t.querySelector('.t-name').textContent = st.name;
+    const F = S.feeds.get(st.id);
+    const v = t.querySelector('video'); if (F) attachVideo(v, F); else { v.srcObject = null; v._feed = null; }
+    t.querySelector('.t-act').textContent = F ? 'Disconnect' : 'Connect';
+    paintTile(t, st, F);
+  }
+  $('#gridEmpty').hidden = list.length > 0;
+  const live = Array.from(S.feeds.values()).filter(f => health(f.stationId).state === 'live').length;
+  $('#monSummary').innerHTML = `<span class="dot ${live ? 'on' : ''}"></span>${live}/${list.length} live`;
+}
+function feedText(F) {
+  if (!F) return 'Disconnected';
+  const h = health(F.stationId).state;
+  if (h === 'live' || h === 'stale') return '';
+  if (F.note) return F.note;
+  if (F.restarting) return 'Restoring network path…';
+  if (F.retryT && F.nextAt) return `${F.attempt > OFFLINE_AFTER ? 'Offline' : 'Reconnecting'} · retry ${F.attempt} in ${Math.max(0, Math.ceil((F.nextAt - Date.now()) / 1000))}s`;
+  return 'Connecting…';
+}
+function feedInfo(F) {
+  if (!F) return '';
+  const p = [];
+  const rtt = F.rtt ?? F.hbRtt; if (rtt != null) p.push(rtt + ' ms');
+  if (F.lastFrame) { const age = Date.now() - F.lastFrame; p.push(age < 2000 ? 'frame now' : 'frame ' + Math.round(age / 1000) + 's ago'); }
+  if (F.fps) p.push(Math.round(F.fps) + ' fps');
+  if (F.relay) p.push('TURN');
+  return p.join(' · ');
+}
+function paintTile(t, st, F) {
+  const h = F ? health(st.id).state : 'offline';
+  t.querySelector('.t-chip').innerHTML = chip(F ? h : 'offline', F ? null : 'Off');
+  t.dataset.state = h;
+  const msg = feedText(F); const m = t.querySelector('.t-msg'); m.textContent = msg; m.hidden = !msg;
+  t.querySelector('.t-info').textContent = feedInfo(F);
+}
+function paintFocused() {
+  const F = S.live; if (!F) return;
+  const h = health(F.stationId).state;
+  const age = F.lastFrame ? Date.now() - F.lastFrame : Infinity;
+  const stale = h === 'stale' && F.frames > 0;
+  $('#staleOverlay').classList.toggle('show', stale);
+  if (stale) $('#staleInfo').textContent = `No new frames for ${Math.floor(age / 1000)}s · last ${new Date(F.lastFrame).toLocaleTimeString()}`;
+  if (h === 'live') { setBadge('live', 'LIVE'); $('#liveMsg').hidden = true; }
+  else if (stale) setBadge('stale', 'STALE');
+  else if (F.offline && !F.session) {
+    setBadge('wait', 'ENDED');
+    if (!$('#liveRedo')) { $('#liveMsg').hidden = false; $('#liveMsg').innerHTML = 'Session ended. Offline mode needs a new QR exchange.<br><br><button class="btn gold" id="liveRedo">New QR exchange</button>'; $('#liveRedo').onclick = () => { const id = F.stationId; S.monitor = false; stopLive(); openOffline(id); }; }
+  } else {
+    const off = h === 'offline';
+    setBadge('wait', off ? 'OFFLINE' : (F.attempt ? 'RECONNECTING' : 'CONNECTING'));
+    const txt = feedText(F) || 'CONNECTING…';
+    $('#liveMsg').hidden = false;
+    if (F.attempt) { if (!$('#liveRetry')) $('#liveMsg').innerHTML = '<span id="liveMsgTxt"></span><br><br><button class="btn gold" id="liveRetry">Retry now</button> <button class="btn" id="liveLast">View last status</button>'; $('#liveMsgTxt').textContent = txt.toUpperCase(); $('#liveRetry').onclick = () => retryNow(F); $('#liveLast').onclick = () => { S.monitor = false; stopLive(); openStatus(); }; }
+    else $('#liveMsg').textContent = txt.toUpperCase();
+  }
+  $('#liveInfo').textContent = feedInfo(F);
+  if (F.recorder) $('#recTime').textContent = fmtDur(Date.now() - F.recStart);
+}
+
+// One loop for every feed: frame freshness (getStats framesDecoded + requestVideoFrameCallback), state, alerts, snapshots.
+let tickN = 0;
+setInterval(async () => {
+  tickN++;
+  for (const F of Array.from(S.feeds.values())) {
+    const s = F.session;
+    if (s && tickN % 2 === 0) {
+      const st = await s.stats();
+      if (st.framesDecoded != null) { if (F.framesDecoded >= 0 && st.framesDecoded > F.framesDecoded) { F.lastFrame = Date.now(); F.frames++; } F.framesDecoded = st.framesDecoded; }
+      F.rtt = st.rtt; F.fps = st.fps; F.relay = st.relay;
+    }
+    if (S.feeds.get(F.stationId) !== F) continue;
+    const prev = health(F.stationId).state;
+    if (s && s.state === 'connected') {
+      const next = feedState({ pcState: 'connected', frames: F.frames, frameAgeMs: F.lastFrame ? Date.now() - F.lastFrame : Infinity, attempt: F.attempt, staleMs: STALE_MS });
+      if (next !== 'connecting' && next !== prev) setHealth(F.stationId, next); // connected but no frame yet: not LIVE
+    }
+    const h = health(F.stationId).state;
+    if (h === 'live') {
+      F.downSince = 0; F.alerted = false; F.wasLive = true;
+      if (!F.snapAt || Date.now() - F.snapAt > 10000) { F.snapAt = Date.now(); snapshot(F); }
+      if (S.settings.alertMotion && tickN % 2 === 0) {
+        const v = S.live === F ? $('#liveVideo') : tileFor(F.stationId)?.querySelector('video');
+        const frac = F.probe.sample(v);
+        if (frac > (MOTION_TH[S.settings.motionSens] || MOTION_TH.medium) && Date.now() - F.motionAt > MOTION_COOLDOWN_MS && Date.now() - F.opened > 5000) { F.motionAt = Date.now(); raiseAlert(F, 'motion'); }
+      }
+    } else if (h !== 'stale') {
+      if (!F.downSince) F.downSince = Date.now();
+      if (F.wasLive && !F.alerted && S.settings.alertOffline && Date.now() - F.downSince > OFFLINE_ALERT_MS) { F.alerted = true; raiseAlert(F, 'offline'); }
+    }
+  }
+  if (S.monitor && $('#monitor').classList.contains('active')) for (const st of Store.stations()) { const t = tileFor(st.id); if (t) paintTile(t, st, S.feeds.get(st.id)); }
+  if (S.live) paintFocused();
+}, 500);
+function raiseAlert(F, kind) {
+  const st = Store.stations().find(s => s.id === F.stationId); const name = st ? st.name : 'Station';
+  const when = new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', second: '2-digit' });
+  const text = kind === 'motion' ? `Motion · ${name} · ${when}` : `${name} went offline · ${when}`;
+  S.alerts.unshift({ kind, text, at: Date.now(), stationId: F.stationId }); S.alerts.length = Math.min(S.alerts.length, 20);
+  const bar = $('#alertBar'); bar.textContent = text; bar.dataset.kind = kind; bar.classList.add('show');
+  clearTimeout(S.alertT); S.alertT = setTimeout(() => bar.classList.remove('show'), 12000);
+  const t = tileFor(F.stationId); if (t) { t.classList.remove('flash'); void t.offsetWidth; t.classList.add('flash'); }
+  if (S.settings.alertSound) beep(kind);
+  if (S.settings.alertVibrate) buzz(kind === 'motion' ? [120, 80, 120] : [300, 120, 300]);
+  if (S.guard && S.guard.on) { S.guard.poke(); S.guard.tick(); }
+  window.SentinelDebug.lastAlert = { kind, text };
+}
+function snapshot(F) {
+  const v = S.live === F ? $('#liveVideo') : tileFor(F.stationId)?.querySelector('video');
+  if (!v || !v.videoWidth) return;
   const c = document.createElement('canvas'); c.width = 240; c.height = Math.round(240 * v.videoHeight / v.videoWidth);
   c.getContext('2d').drawImage(v, 0, 0, c.width, c.height);
-  try { Store.upsertStation({ id: stationId, lastSnapshot: c.toDataURL('image/jpeg', 0.6), lastSeen: Date.now() }); } catch { }
+  try { Store.upsertStation({ id: F.stationId, lastSnapshot: c.toDataURL('image/jpeg', 0.6), lastSeen: Date.now() }); } catch { }
 }
 const fmtDur = ms => { const s = Math.floor(ms / 1000); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`; };
 
@@ -388,6 +618,7 @@ export function pickMime() {
 }
 function startRecording() {
   const L = S.live; if (!L || !L.session) return toast('Not connected yet');
+  if (!L.session.remoteStream.getTracks().some(t => t.readyState === 'live')) return toast('No video yet');
   const mime = pickMime(); if (mime === null) return toast('Recording is not supported on this browser');
   const stream = new MediaStream(L.session.remoteStream.getTracks().filter(t => t.readyState === 'live'));
   const rec = new MediaRecorder(stream, mime ? { mimeType: mime, videoBitsPerSecond: 2_000_000 } : {});
@@ -407,10 +638,10 @@ function startRecording() {
   L.recorder = rec; L.recStart = Date.now();
   $('#btnRecord').classList.add('rec-on'); $('#recBadge').hidden = false;
 }
-function stopRecording() {
-  const L = S.live; if (!L || !L.recorder) return;
+function stopRecording(F = S.live) {
+  const L = F; if (!L || !L.recorder) return;
   try { L.recorder.stop(); } catch { }
-  L.recorder = null; $('#btnRecord').classList.remove('rec-on'); $('#recBadge').hidden = true;
+  L.recorder = null; if (S.live === L || !S.live) { $('#btnRecord').classList.remove('rec-on'); $('#recBadge').hidden = true; }
 }
 
 // ----- last status -----
@@ -434,19 +665,29 @@ async function ensureCamera() {
   for (const s of C.sessions) { await s.setVideoTrack(C.cam.getVideoTracks()[0]); }
   return C.cam;
 }
-async function requestWake() {
-  const C = S.station;
-  if (!('wakeLock' in navigator)) { C.wakeNote = 'Wake Lock not supported: set Auto-Lock to Never'; return renderStationStatus(); }
-  try { C.wake = await navigator.wakeLock.request('screen'); C.wakeNote = 'Screen Wake Lock on'; C.wake.addEventListener('release', () => { C.wakeNote = 'Wake Lock released'; renderStationStatus(); }); }
-  catch (e) { C.wakeNote = 'Wake Lock refused (' + e.name + '): set Auto-Lock to Never'; }
-  renderStationStatus();
+// Keep the screen awake while anything is being watched or streamed (and the user has not turned it off).
+function watching() { return S.station.active || S.feeds.size > 0 || (S.guard && S.guard.on); }
+function updateWake() { if (S.settings.keepAwake && watching()) S.wake.enable(); else if (S.wake.wanted) S.wake.disable(); paintWake(); }
+function requestWake() { updateWake(); } // fire-and-forget: never blocks camera start
+function wakeLabel() {
+  const w = S.wake;
+  if (!S.settings.keepAwake) return ['off', 'Keep screen awake: OFF'];
+  if (!watching()) return ['idle', 'Keep screen awake: ON (when monitoring)'];
+  return { on: ['on', 'Screen awake · Wake Lock'], fallback: ['on', 'Screen awake · video fallback'], denied: ['warn', 'Tap screen to keep awake'], paused: ['idle', 'Screen awake (paused while hidden)'] }[w.state] || ['idle', 'Keep screen awake: starting…'];
 }
+function paintWake() {
+  const [cls, txt] = wakeLabel();
+  $$('.wake-toggle').forEach(b => { b.dataset.state = cls; b.querySelector('span').textContent = txt; b.setAttribute('aria-pressed', String(!!S.settings.keepAwake)); });
+  S.station.wakeNote = S.settings.keepAwake ? (S.wake.detail || txt) : 'Off (you turned keep-awake off)';
+  if ($('#stationActive').classList.contains('active')) renderStationStatus();
+}
+function toggleWake() { unlockAudio(); S.settings = Store.patchSettings({ keepAwake: !S.settings.keepAwake }); updateWake(); toast(S.settings.keepAwake ? 'Screen will stay awake while monitoring' : 'Screen may sleep normally'); }
 async function startStation() {
   try { await ensureCamera(); }
   catch (e) { toast('Camera blocked: allow Camera and Microphone for Sentinel in Settings'); return false; }
   S.station.active = true;
-  try { const a = $('#talkAudio'); a.muted = true; await a.play().catch(() => { }); a.muted = false; } catch { } // unlock audio output with this tap
-  await requestWake();
+  try { const a = $('#talkAudio'); a.muted = true; const p = a.play(); a.muted = false; if (p) p.catch(() => { }); } catch { } // unlock audio output with this tap (never await: play() on an empty element can stay pending)
+  requestWake();
   show('stationActive');
   renderStationStatus();
   if (S.settings.signaling === 'peerjs' && (!S.broker || S.broker.status !== 'online')) startBroker();
@@ -456,8 +697,8 @@ function stopStation() {
   const C = S.station; C.active = false;
   for (const s of C.sessions) s.close(); C.sessions.clear();
   if (C.cam) C.cam.getTracks().forEach(t => t.stop()); C.cam = null;
-  if (C.wake) C.wake.release().catch(() => { }); C.wake = null;
-  $('#dim').classList.remove('show');
+  if (S.guard && S.guard.on) S.guard.release();
+  updateWake();
   show('stationHome', false); S.history = []; render();
 }
 async function stationSwitchCamera() {
@@ -485,6 +726,7 @@ function wireStationSession(session, ccName) {
       if (m.on && session.talkStream) { a.srcObject = session.talkStream; a.play().catch(() => toast('Tap the screen to allow talk-back audio')); }
       window.SentinelDebug.talkOn = !!m.on;
     }
+    if (m.t === 'hb') { session.lastHb = Date.now(); session.send({ t: 'hb-ack', ts: m.ts }); }
     if (m.t === 'bye') session.close();
   });
   session.addEventListener('state', e => {
@@ -494,9 +736,14 @@ function wireStationSession(session, ccName) {
   window.SentinelDebug.stationSession = session;
   renderStationStatus();
 }
+// Station watchdog: a viewer that sent heartbeats and then went silent for 20 s is gone; free its session.
+setInterval(() => {
+  for (const s of S.station.sessions) if (s.lastHb && Date.now() - s.lastHb > 20000 && s.state !== 'connected') s.close();
+  if ($('#stationActive').classList.contains('active')) renderStationStatus();
+}, 5000);
 function pairedCC(ccId, secret) { return Store.devices().find(d => d.id === ccId && (!d.secret || d.secret === secret)); }
 function stIncoming(conn) {
-  let authed = null;
+  let authed = null; const bySid = new Map();
   conn.on('data', async msg => {
     if (!msg || !msg.t) return;
     if (msg.t === 'ping') {
@@ -507,12 +754,15 @@ function stIncoming(conn) {
       if (!cc) return conn.send({ t: 'denied' });
       if (!S.station.active) return conn.send({ t: 'not-active' });
       authed = cc; conn.send({ t: 'hello-ok' });
+    } else if (msg.t === 'offer' && authed && msg.restart && bySid.has(msg.sid) && !bySid.get(msg.sid).closed) {
+      try { conn.send({ t: 'answer', sid: msg.sid, sdp: await bySid.get(msg.sid).reanswer(msg.sdp) }); } // ICE restart on the live session
+      catch (e) { conn.send({ t: 'error', error: String(e) }); }
     } else if (msg.t === 'offer' && authed) {
       try {
         const cam = await ensureCamera();
         const session = new MediaSession('camera', S.settings);
         const sdp = await session.answerOffer(msg.sdp, cam);
-        wireStationSession(session, authed.n);
+        wireStationSession(session, authed.n); bySid.set(msg.sid, session);
         conn.send({ t: 'answer', sid: msg.sid, sdp });
       } catch (e) { conn.send({ t: 'error', error: String(e) }); }
     }
@@ -535,7 +785,7 @@ async function stApprove() {
   if (kind === 'HAIL1P') {
     try {
       if (data.br) S.settings = Store.patchSettings({ broker: data.br });
-      if (!S.broker || S.broker.status !== 'online') await startBroker();
+      await ensureBroker();
       if (!S.broker || S.broker.status !== 'online') throw new Error('Broker offline. Try offline pairing.');
       const conn = await S.broker.connect(data.cc, 10000);
       conn.send({ t: 'pair-req', tok: data.tok, id: S.id, n: deviceName(), secret });
@@ -544,8 +794,9 @@ async function stApprove() {
       if (r.t === 'pair-fail') { toast('Pairing refused: ' + r.reason); window.SentinelDebug.lastPair = r; return showStationHome(); }
       Store.upsertDevice({ id: data.cc, n: r.n || data.n, secret, mode: 'peerjs', pairedAt: Date.now() });
       window.SentinelDebug.lastPair = r;
-      toast('Paired with ' + (r.n || data.n));
+      toast('Paired with ' + (r.n || data.n) + ' · starting camera');
       showStationHome();
+      if (!S.station.active) startStation(); // one-tap: approving also turns this station on
     } catch (e) { toast('Pairing failed: ' + e.message); window.SentinelDebug.lastPair = { t: 'error', error: e.message }; showStationHome(); }
   } else {
     try {
@@ -596,7 +847,7 @@ export async function handleScan(text) {
 }
 
 // ---------- rendering ----------
-function chip(state) { return `<span class="chip ${state}">${{ live: 'Live', reconnecting: 'Reconnecting', stale: 'Stale', offline: 'Offline' }[state]}</span>`; }
+function chip(state, label) { return `<span class="chip ${state}">${label || { live: 'Live', reconnecting: 'Connecting', stale: 'Stale', offline: 'Offline' }[state]}</span>`; }
 function render() {
   const role = S.settings.role;
   if (role === 'command') {
@@ -609,10 +860,14 @@ function render() {
       return `<li data-st="${esc(st.id)}"><img class="thumb" ${st.lastSnapshot ? `src="${st.lastSnapshot}"` : ''} alt=""><div class="grow"><div class="name">${esc(st.name)}</div><div class="muted small">${dev ? esc(dev.n) : 'No device assigned'}</div></div>${chip(health(st.id).state)}</li>`;
     }).join('') || '<li class="muted small">No stations yet. Tap CONNECT A STATION.</li>';
     $$('#homeStations li[data-st]').forEach(li => li.onclick = () => startLive(li.dataset.st));
+    $('#monitorBtn').hidden = !assigned().length;
+    $('#monitorBtn small').textContent = `${assigned().length} camera${assigned().length === 1 ? '' : 's'} · grid · alerts`;
+    if (S.monitor) renderGrid();
     if ($('#stations').classList.contains('active')) renderStations();
     if ($('#live').classList.contains('active')) renderStrip();
   } else if (role === 'station') {
     const cc = Store.devices();
+    $('#startStation').classList.toggle('pulse', cc.length > 0 && !S.station.active);
     $('#ccList').innerHTML = cc.map(d => `<li><div class="grow"><div class="name">${esc(d.n)}</div><div class="muted small">${d.mode === 'offline' ? 'Offline QR' : 'Broker'} · paired ${fmtTime(d.pairedAt)}</div></div><button class="btn icon" data-unpair="${esc(d.id)}">Unpair</button></li>`).join('') || '<li class="muted small">Not paired yet.</li>';
     $$('[data-unpair]').forEach(b => b.onclick = () => { if (confirm('Unpair this command center?')) { Store.removeDevice(b.dataset.unpair); render(); } });
   }
@@ -670,13 +925,20 @@ function renderSettings() {
   $('#setName').value = s.deviceName || '';
   $('#bHost').value = s.broker.host; $('#bPort').value = s.broker.port; $('#bPath').value = s.broker.path; $('#bKey').value = s.broker.key; $('#bSecure').value = String(s.broker.secure !== false);
   $('#sStun').value = s.stun; $('#sTurn').value = s.turnUrl; $('#sTurnU').value = s.turnUser; $('#sTurnP').value = s.turnPass;
-  $('#aboutBox').innerHTML = `H.A.I.L. Sentinel v${VERSION} · ${isStandalone() ? 'Running as Home Screen app' : 'Running in a browser tab'}<br>Device ID: <span class="num">${esc(S.id)}</span><br>PeerJS 1.5.5 · jsQR 1.4.0 · qrcode-generator 2.0.4 (vendored)<br>Wake Lock: ${'wakeLock' in navigator ? 'available' : 'not available'} · Recording: ${esc(pickMime() || 'n/a')}`;
+  for (const k of ['keepAwake', 'autoStart', 'autoMonitor', 'alertOffline', 'alertMotion', 'alertSound', 'alertVibrate']) $('#set_' + k).checked = !!s[k];
+  $('#setSens').value = s.motionSens || 'medium'; $('#setGuardStyle').value = s.guardStyle || 'black';
+  $('#pinState').textContent = s.guardPinHash ? `PIN set (${s.guardPinLen} digits)` : 'No PIN: unlock by press-and-hold';
+  $('#setPin').value = ''; $('#clearPin').hidden = !s.guardPinHash;
+  $('#rowAutoStart').hidden = s.role !== 'station'; $('#rowAutoMonitor').hidden = s.role !== 'command';
+  $('#vibNote').textContent = 'vibrate' in navigator ? '' : '(not supported on iPhone/iPad Safari)';
+  $('#aboutBox').innerHTML = `H.A.I.L. Sentinel v${VERSION} · ${isStandalone() ? 'Running as Home Screen app' : 'Running in a browser tab'}<br>Device ID: <span class="num">${esc(S.id)}</span><br>PeerJS 1.5.5 · jsQR 1.4.0 · qrcode-generator 2.0.4 (vendored)<br>Wake Lock: ${'wakeLock' in navigator ? 'available' : 'not available (video fallback)'}${iosVersion() ? ' · iOS ' + iosVersion() : ''} · Recording: ${esc(pickMime() || 'n/a')}`;
 }
 function renderStationStatus() {
   const C = S.station; const v = C.cam && C.cam.getVideoTracks()[0];
   const viewers = Array.from(C.sessions).filter(s => s.state === 'connected').length;
   $('#stationLine').textContent = viewers ? `Streaming to ${viewers} command center${viewers > 1 ? 's' : ''}` : 'Waiting for command center';
-  $('#stationStatus').innerHTML = `Camera: <b>${v && v.readyState === 'live' ? (S.settings.facing === 'user' ? 'front' : 'back') + ' · on' : 'stopped'}</b><br>Screen: <b>${esc(C.wakeNote || '…')}</b><br>Signaling: <b>${S.settings.signaling === 'offline' ? 'offline QR' : 'PeerJS broker'}</b><br>Device: <span class="num">${esc(deviceName())}</span>`;
+  const hb = Array.from(C.sessions).map(s => s.lastHb).filter(Boolean).sort().pop();
+  $('#stationStatus').innerHTML = `Camera: <b>${v && v.readyState === 'live' ? (S.settings.facing === 'user' ? 'front' : 'back') + ' · on' : 'stopped'}</b><br>Screen: <b>${esc(C.wakeNote || '…')}</b><br>Signaling: <b>${S.settings.signaling === 'offline' ? 'offline QR' : 'PeerJS broker · ' + esc(S.broker ? S.broker.status : 'off')}</b><br>Viewers: <b>${viewers}</b>${hb ? ` · heartbeat <span class="mono">${Math.round((Date.now() - hb) / 1000)}s ago</span>` : ''}<br>Device: <span class="num">${esc(deviceName())}</span>`;
 }
 
 // ---------- init / routing ----------
@@ -715,13 +977,21 @@ function wire() {
   $('#playClose').onclick = () => { const v = $('#playVideo'); v.pause(); URL.revokeObjectURL(v.src); $('#playDlg').close(); };
   $$('#segRole button').forEach(b => b.onclick = () => { $$('#segRole button').forEach(x => x.classList.toggle('on', x === b)); });
   $$('#segSig button').forEach(b => b.onclick = () => { $$('#segSig button').forEach(x => x.classList.toggle('on', x === b)); });
-  $('#saveSettings').onclick = () => {
+  $('#saveSettings').onclick = async () => {
     const role = $('#segRole button.on')?.dataset.v || S.settings.role;
     S.settings = Store.patchSettings({
       deviceName: $('#setName').value.trim(), signaling: $('#segSig button.on')?.dataset.v || 'peerjs',
       broker: { host: $('#bHost').value.trim() || DEFAULT_BROKER.host, port: Number($('#bPort').value) || 443, path: $('#bPath').value.trim() || '/', key: $('#bKey').value.trim() || 'peerjs', secure: $('#bSecure').value === 'true' },
       stun: $('#sStun').value.trim(), turnUrl: $('#sTurn').value.trim(), turnUser: $('#sTurnU').value.trim(), turnPass: $('#sTurnP').value,
+      ...Object.fromEntries(['keepAwake', 'autoStart', 'autoMonitor', 'alertOffline', 'alertMotion', 'alertSound', 'alertVibrate'].map(k => [k, $('#set_' + k).checked])),
+      motionSens: $('#setSens').value, guardStyle: $('#setGuardStyle').value,
     });
+    const pin = $('#setPin').value.trim();
+    if (pin) {
+      if (!/^\d{4,8}$/.test(pin)) return toast('PIN must be 4 to 8 digits');
+      const salt = randomId(8); S.settings = Store.patchSettings({ guardPinSalt: salt, guardPinHash: await hashPin(pin, salt), guardPinLen: pin.length });
+    }
+    unlockAudio(); updateWake();
     toast('Saved'); applyRole(role);
   };
   $('#resetAll').onclick = async () => { if (confirm('Erase all pairings, stations and settings on this device? Recordings stay in the vault.')) { Store.clearAll(); location.href = location.pathname; } };
@@ -729,13 +999,39 @@ function wire() {
   $('#stationScan').onclick = () => openScanner('Scan the pairing code on the command center.');
   $('#approveYes').onclick = stApprove; $('#approveNo').onclick = stDeny;
   $('#stopStation').onclick = stopStation;
-  $('#dimBtn').onclick = () => $('#dim').classList.add('show');
-  $('#dim').onclick = () => $('#dim').classList.remove('show');
+  $$('[data-guard]').forEach(b => b.onclick = () => { unlockAudio(); S.guard.engage(); });
+  $$('.wake-toggle').forEach(b => b.onclick = toggleWake);
+  $$('[data-help]').forEach(b => b.onclick = () => show('help'));
+  $('#monitorBtn').onclick = () => { unlockAudio(); openMonitor(); };
+  $('#monBack').onclick = leaveMonitor;
+  $('#monConnectAll').onclick = () => { assigned().forEach(st => { const F = S.feeds.get(st.id); F ? retryNow(F) : openFeed(st.id); }); };
+  $('#monDisconnectAll').onclick = () => closeAllFeeds();
+  $('#gridPair').onclick = openPair;
+  $('#liveGrid').onclick = () => { if (!S.monitor) { const keep = S.live; S.monitor = true; S.live = null; assigned().forEach(st => openFeed(st.id)); show('monitor', false); S.history = ['home']; renderGrid(); if (keep) attachVideo(tileFor(keep.stationId)?.querySelector('video'), keep); } else stopLive(); };
+  $('#alertBar').onclick = () => { const a = S.alerts[0]; $('#alertBar').classList.remove('show'); const F = a && S.feeds.get(a.stationId); if (F && F.session) focusFeed(F); };
+  $('#codeJoin').onclick = () => joinByCode($('#codeInput').value);
+  $('#codeInput').addEventListener('keydown', e => { if (e.key === 'Enter') joinByCode($('#codeInput').value); });
+  $('#codeInput').addEventListener('input', e => { const v = e.target.value.toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 6); e.target.value = v.length > 3 ? v.slice(0, 3) + '-' + v.slice(3) : v; });
+  $('#pairCopy').onclick = () => { if (S.pairLink) navigator.clipboard.writeText(S.pairLink).then(() => toast('Pairing link copied')).catch(() => toast('Copy blocked: use Share')); };
+  $('#clearPin').onclick = () => { S.settings = Store.patchSettings({ guardPinHash: '', guardPinSalt: '', guardPinLen: 0 }); renderSettings(); toast('PIN removed'); };
+  document.addEventListener('screen', e => { if (e.detail !== 'pair') stopPairCode(); });
   document.addEventListener('visibilitychange', async () => {
-    if (document.visibilityState !== 'visible' || S.settings.role !== 'station' || !S.station.active) return;
-    try { await ensureCamera(); } catch { } // iOS kills the camera in the background: restart it on return
-    requestWake();
+    if (document.visibilityState !== 'visible') return;
+    if (S.settings.role === 'station' && S.station.active) { try { await ensureCamera(); } catch { } } // iOS kills the camera in the background: restart it on return
+    updateWake();
+    reconnectEverything('visible');
   });
+  window.addEventListener('online', () => { $('#netBar').classList.remove('show'); toast('Back online · reconnecting'); reconnectEverything('online'); });
+  window.addEventListener('offline', () => $('#netBar').classList.add('show'));
+  window.addEventListener('pageshow', e => { if (e.persisted) reconnectEverything('pageshow'); });
+  S.wake.addEventListener('change', paintWake);
+}
+function guardStatus() {
+  const a = S.alerts[0] && Date.now() - S.alerts[0].at < 60000 ? `<div class="g-alert">${esc(S.alerts[0].text)}</div>` : '';
+  const awake = S.wake.state === 'on' || S.wake.state === 'fallback' ? 'screen awake' : 'screen may sleep';
+  if (S.settings.role === 'station') { const n = Array.from(S.station.sessions).filter(s => s.state === 'connected').length; return `<span class="dot ${S.station.active ? 'on' : ''}"></span>${S.station.active ? 'STATION ACTIVE' : 'STATION STOPPED'} · ${n} viewer${n === 1 ? '' : 's'} · ${awake}${a}`; }
+  const live = Array.from(S.feeds.values()).filter(f => health(f.stationId).state === 'live').length;
+  return `<span class="dot ${live ? 'on' : ''}"></span>${live}/${S.feeds.size} cameras live · ${awake}${a}`;
 }
 function handleDeepLink() {
   const hp = /[#&]p=([^&]+)/.exec(location.hash);
@@ -745,26 +1041,45 @@ function handleDeepLink() {
   if (role === 'station' || role === 'command') { if (S.settings.role !== role) applyRole(role); }
   if (!S.settings.role) { show('role', false); return; }
   if (action === 'live') { if (S.settings.role === 'command') setTimeout(onLiveButton, S.settings.signaling === 'peerjs' ? 1800 : 0); else toast('Tap START STATION to turn the camera on'); }
+  if (action === 'monitor' && S.settings.role === 'command') setTimeout(openMonitor, 300);
   if (action === 'pair') { if (S.settings.role === 'command') openPair(); else openScanner('Scan the pairing code on the command center.'); }
   if (role || action) history.replaceState(null, '', location.pathname);
 }
 
 window.SentinelDebug = {
   S, Store, Vault, handleScan, pickStation, liveButtonState, openPair, openOffline, startLive, stopLive, pickMime,
+  openMonitor, leaveMonitor, closeFeed, openFeed, retryNow, reconnectEverything, tryIceRestart, joinByCode, updateWake, raiseAlert, nextDelay,
   stopCameraTrack() { const t = S.station.cam && S.station.cam.getVideoTracks()[0]; if (t) t.stop(); return !!t; },
   decodeQrCanvas(sel) { return decodeCanvas(document.querySelector(sel)); },
 };
 
 async function boot() {
+  S.guard = new Guard($('#guard'), () => S.settings, guardStatus);
+  S.guard.addEventListener('engage', updateWake); S.guard.addEventListener('release', updateWake);
   wire();
+  if (navigator.onLine === false) $('#netBar').classList.add('show');
   if (S.settings.role === 'command') show('home', false);
   else if (S.settings.role === 'station') show('stationHome', false);
   else show('role', false);
   setTimeout(() => { const sp = document.getElementById('splash'); if (sp) { sp.classList.add('hide'); setTimeout(() => sp.remove(), 600); } }, 900);
   handleDeepLink();
-  if (S.settings.role && !S.broker) startBroker();
-  render();
-  if ('serviceWorker' in navigator && location.protocol !== 'file:') navigator.serviceWorker.register('sw.js').catch(e => console.warn('sw', e));
+  if (S.settings.role && !S.broker) ensureBroker();
+  render(); paintWake();
+  const q = new URLSearchParams(location.search);
+  if (!q.has('action') && !location.hash) {
+    if (S.settings.role === 'command' && S.settings.autoMonitor && assigned().length) setTimeout(openMonitor, 600);
+    if (S.settings.role === 'station' && S.settings.autoStart && Store.devices().length) setTimeout(() => startStation().then(ok => { if (!ok) toast('Tap START STATION to turn the camera on'); }), 600);
+  }
+  if ('serviceWorker' in navigator && location.protocol !== 'file:') {
+    const hadController = !!navigator.serviceWorker.controller;
+    navigator.serviceWorker.register('sw.js').then(r => r.update().catch(() => { })).catch(e => console.warn('sw', e));
+    // A new version took over: reload now if nothing is streaming, otherwise on the next return to the app.
+    navigator.serviceWorker.addEventListener('controllerchange', () => {
+      if (!hadController) return;
+      if (!S.feeds.size && !S.station.active) location.reload();
+      else { S.updatePending = true; toast('Sentinel update ready: it applies next time you open the app', 4000); }
+    });
+  }
   window.SentinelDebug.ready = true;
 }
 if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot); else boot();

@@ -5,10 +5,17 @@ const DEFAULT_SETTINGS = {
   deviceName: '',
   signaling: 'peerjs',       // 'peerjs' | 'offline'
   broker: { host: '0.peerjs.com', port: 443, path: '/', secure: true, key: 'peerjs' },
-  stun: 'stun:stun.l.google.com:19302',
+  stun: 'stun:stun.l.google.com:19302, stun:stun1.l.google.com:19302, stun:stun2.l.google.com:19302, stun:stun3.l.google.com:19302',
   turnUrl: '', turnUser: '', turnPass: '',   // entered by the user on-device only; never shipped in code
   facing: 'environment',
+  keepAwake: true,           // hold the screen awake while monitoring / station active
+  autoStart: false,          // station: start camera when Sentinel opens
+  autoMonitor: false,        // command center: open the monitor grid when Sentinel opens
+  alertOffline: true, alertMotion: false, alertSound: true, alertVibrate: true, motionSens: 'medium',
+  guardStyle: 'black',       // 'black' | 'dim'
+  guardPinHash: '', guardPinSalt: '', guardPinLen: 0,
 };
+const OLD_STUN = 'stun:stun.l.google.com:19302';
 function read(name, dflt) {
   try { const v = localStorage.getItem(K + name); return v ? JSON.parse(v) : structuredClone(dflt); }
   catch { return structuredClone(dflt); }
@@ -21,7 +28,11 @@ export function randomId(bytes = 8) {
 }
 
 export const Store = {
-  settings() { return Object.assign(structuredClone(DEFAULT_SETTINGS), read('settings', {})); },
+  settings() {
+    const s = Object.assign(structuredClone(DEFAULT_SETTINGS), read('settings', {}));
+    if (!s.stun || s.stun.trim() === OLD_STUN) s.stun = DEFAULT_SETTINGS.stun; // v1.x default -> multi-server STUN
+    return s;
+  },
   saveSettings(s) { write('settings', s); },
   patchSettings(p) { const s = this.settings(); Object.assign(s, p); this.saveSettings(s); return s; },
   identity() {

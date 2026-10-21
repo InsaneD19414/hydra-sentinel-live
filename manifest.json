@@ -20,6 +20,7 @@
   ],
   "shortcuts": [
     { "name": "Hydra Live View", "url": "./?action=live", "icons": [{ "src": "icons/icon-192.png", "sizes": "192x192" }] },
+    { "name": "Monitor all cameras", "url": "./?action=monitor", "icons": [{ "src": "icons/icon-192.png", "sizes": "192x192" }] },
     { "name": "Hydra Pair Station", "url": "./?action=pair", "icons": [{ "src": "icons/icon-192.png", "sizes": "192x192" }] },
     { "name": "Camera Station mode", "url": "./?role=station", "icons": [{ "src": "icons/icon-192.png", "sizes": "192x192" }] }
   ]

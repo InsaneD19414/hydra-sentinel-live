@@ -25,6 +25,8 @@
 <script type="module" src="js/app.js"></script>
 </head>
 <body>
+<div id="netBar" class="net-bar">NO INTERNET · Sentinel will reconnect automatically</div>
+<div id="alertBar" class="alert-bar" role="alert"></div>
 <div id="splash" aria-hidden="true"><img src="img/banner.jpg" alt=""></div>
 
 <!-- ROLE PICKER -->
@@ -43,6 +45,7 @@
   <img class="banner" src="img/banner.jpg" alt="HYDRA Advanced Intelligence">
   <div class="row" style="margin-top:10px"><span class="kicker grow">Command Center</span><span id="brokerChip" class="chip offline">Broker</span></div>
   <button id="liveBtn" class="live-btn"><span id="liveBtnLabel">LIVE VIEW</span><small id="liveBtnSub"></small></button>
+  <button id="monitorBtn" class="btn block outline-gold" hidden><b>MONITOR ALL CAMERAS</b><small class="muted"></small></button>
   <h3>Stations</h3>
   <ul id="homeStations" class="list"></ul>
   <div class="grid2">
@@ -51,17 +54,20 @@
     <button class="btn" data-go="vault">Vault</button>
     <button class="btn" data-go="settings">Settings</button>
   </div>
+  <button class="btn block ghost" data-help>How to use · iPhone tips</button>
   <p class="muted small center" style="margin-top:18px">ANALYZE // AUTOMATE // DOMINATE</p>
 </section>
 
 <!-- PAIR (command center shows QR) -->
 <section id="pair" class="screen">
   <div class="topbar"><button class="btn icon ghost" data-back>&#8249;</button><h2 class="grow">Pair a station</h2><img src="img/crest-256.png" class="toplogo" alt=""></div>
-  <p class="muted small">On the other iPhone or iPad: point the regular <b>Camera</b> app at this code and tap the Sentinel link (or use <b>Pair with command center</b> inside Sentinel). Then tap <b>Approve</b> on that device.</p>
+  <p class="muted small">On the camera iPhone/iPad, do <b>one</b> of these, then tap <b>Approve</b> there:</p>
+  <ol class="small muted steps"><li>Point the regular <b>Camera</b> app at this QR and tap the Sentinel link, <b>or</b></li><li>Open Sentinel &rarr; Camera Station &rarr; type the code below, <b>or</b></li><li>Send it the link (AirDrop / Messages) and tap it.</li></ol>
+  <div id="pairCodeWrap" class="code-wrap"><span class="kicker">Pairing code</span><div id="pairCode" class="pair-code mono">······</div></div>
   <div class="qrbox"><canvas id="pairQr" aria-label="Pairing QR code"></canvas></div>
   <div id="pairCountdown" class="countdown">5:00</div>
   <p id="pairStatus" class="center muted small">Single-use code. Expires in 5 minutes.</p>
-  <button class="btn block gold" id="pairShare">Share pairing link (AirDrop / Messages)</button>
+  <div class="grid2"><button class="btn gold" id="pairShare">Share link</button><button class="btn" id="pairCopy">Copy link</button></div>
   <button class="btn block" id="pairRefresh">New code</button>
   <button class="btn block ghost" id="pairUseOffline">No internet? Use offline pairing</button>
 </section>
@@ -89,9 +95,13 @@
   <div class="live-top">
     <button class="btn icon ghost" id="liveClose" aria-label="Close">&#10005;</button>
     <span class="title" id="liveTitle">Station</span>
+    <button class="btn icon ghost" id="liveGrid" aria-label="All cameras"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="8" height="8"/><rect x="13" y="3" width="8" height="8"/><rect x="3" y="13" width="8" height="8"/><rect x="13" y="13" width="8" height="8"/></svg></button>
+    <button class="btn icon ghost" data-guard aria-label="Guard mode"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 018 0v4"/></svg></button>
     <span id="recBadge" class="badge rec" hidden>● REC <span id="recTime">0:00</span></span>
     <span id="liveBadge" class="badge wait">CONNECTING</span>
   </div>
+  <div id="liveInfo" class="live-info mono"></div>
+  <div class="live-wake"><button class="wake-toggle" aria-pressed="true"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg><span>Keep screen awake</span></button></div>
   <div id="stationStrip" class="station-strip"></div>
   <div class="live-controls">
     <button class="ctl" id="btnRecord" aria-label="Record"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="7" fill="#B11226"/></svg>RECORD</button>
@@ -99,6 +109,16 @@
     <button class="ctl talk" id="btnTalk" aria-label="Hold to talk"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0014 0M12 18v3"/></svg>HOLD TO TALK</button>
     <button class="ctl" id="btnSwitch" aria-label="Switch camera"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 8h3l2-3h6l2 3h3v11H4z"/><path d="M9 13a3 3 0 015-2l1 1M15 13a3 3 0 01-5 2l-1-1"/></svg>FLIP</button>
   </div>
+</section>
+
+<!-- MONITOR GRID -->
+<section id="monitor" class="screen">
+  <div class="topbar"><button class="btn icon ghost" id="monBack" aria-label="Back">&#8249;</button><h2 class="grow">Monitor</h2><span id="monSummary" class="mon-sum mono"></span><button class="btn icon ghost" data-guard aria-label="Guard mode"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 018 0v4"/></svg></button></div>
+  <button class="wake-toggle" aria-pressed="true"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg><span>Keep screen awake</span></button>
+  <div id="grid" class="grid"></div>
+  <div id="gridEmpty" class="card center" hidden><p class="muted">No cameras yet.</p><button class="btn gold" id="gridPair">+ Add a camera</button></div>
+  <div class="grid2" style="margin-top:12px"><button class="btn" id="monConnectAll">Connect all</button><button class="btn ghost" id="monDisconnectAll">Disconnect all</button></div>
+  <p class="muted small">Tap a camera for fullscreen with record, listen and talk. Feeds reconnect on their own. Turn on motion alerts in Settings.</p>
 </section>
 
 <!-- LAST STATUS -->
@@ -150,7 +170,21 @@
     <div class="grid2"><div><label for="sTurnU">TURN user</label><input id="sTurnU" autocomplete="off"></div><div><label for="sTurnP">TURN password</label><input id="sTurnP" type="password" autocomplete="off"></div></div>
     <p class="muted small">TURN credentials are typed here and stored only on this device. They are never in the app code.</p>
   </details>
+  <h3 style="margin-top:18px">Monitoring</h3>
+  <label class="check"><input type="checkbox" id="set_keepAwake"> Keep screen awake while monitoring / streaming</label>
+  <label class="check" id="rowAutoStart"><input type="checkbox" id="set_autoStart"> Start the camera automatically when Sentinel opens</label>
+  <label class="check" id="rowAutoMonitor"><input type="checkbox" id="set_autoMonitor"> Open the monitor grid when Sentinel opens</label>
+  <label class="check"><input type="checkbox" id="set_alertOffline"> Alert when a camera goes offline</label>
+  <label class="check"><input type="checkbox" id="set_alertMotion"> Motion alerts</label>
+  <label for="setSens">Motion sensitivity</label><select id="setSens"><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option></select>
+  <label class="check"><input type="checkbox" id="set_alertSound"> Alert sound</label>
+  <label class="check"><input type="checkbox" id="set_alertVibrate"> Vibrate <span id="vibNote" class="muted small"></span></label>
+  <h3 style="margin-top:18px">Guard mode</h3>
+  <label for="setGuardStyle">Guard screen</label><select id="setGuardStyle"><option value="black">Black (lowest light, OLED off)</option><option value="dim">Dim (feeds faintly visible)</option></select>
+  <label for="setPin">Unlock PIN (optional, 4-8 digits)</label><input id="setPin" inputmode="numeric" pattern="[0-9]*" maxlength="8" autocomplete="off" placeholder="Leave empty for press-and-hold">
+  <div class="row"><span id="pinState" class="muted small grow"></span><button class="btn icon ghost" id="clearPin">Remove PIN</button></div>
   <button class="btn block gold" id="saveSettings">Save</button>
+  <button class="btn block ghost" data-help>How to use · iPhone tips</button>
   <div class="card small muted" id="aboutBox"></div>
   <button class="btn block ghost" id="resetAll">Erase all pairings and settings</button>
 </section>
@@ -160,11 +194,13 @@
   <img class="banner" src="img/banner.jpg" alt="HYDRA Advanced Intelligence">
   <div class="row" style="margin-top:10px"><span class="kicker grow">Camera Station</span><span id="brokerChip2" class="chip offline">Broker</span></div>
   <button id="startStation" class="live-btn">START STATION<small>Camera on, ready for your command center</small></button>
+  <div class="card"><label for="codeInput" style="margin-top:0">Pair with code</label>
+    <div class="row"><input id="codeInput" class="grow mono code-in" placeholder="K7Q-4MZ" autocapitalize="characters" autocomplete="off" autocorrect="off" spellcheck="false" maxlength="7" inputmode="text"><button class="btn gold" id="codeJoin">Pair with code</button></div></div>
   <button class="btn block crimson" id="stationScan">Pair with command center (scan QR)</button>
   <h3>Paired command centers</h3>
   <ul id="ccList" class="list"></ul>
   <div class="notice small"><b>Keep Sentinel open and the iPhone plugged in.</b> iOS stops the camera whenever this app is closed, switched away from, or the screen locks.</div>
-  <button class="btn block" data-go="settings">Settings</button>
+  <div class="grid2"><button class="btn" data-go="settings">Settings</button><button class="btn ghost" data-help>Help</button></div>
 </section>
 
 <!-- SCANNER -->
@@ -210,11 +246,26 @@
   <video id="stationPreview" playsinline autoplay muted></video>
   <div id="talkIndicator" class="notice gold" hidden><b>Command center is talking</b></div>
   <div class="card small" id="stationStatus"></div>
-  <div class="notice small"><b>Do not close Sentinel or lock this iPhone.</b> iOS stops the camera when the app is closed, in the background, or the screen locks. Keep it plugged in with Sentinel open. Set Auto-Lock to Never while it is a station.</div>
-  <div class="grid2"><button class="btn gold" id="dimBtn">Dim screen</button><button class="btn crimson" id="stopStation">Stop station</button></div>
+  <div class="notice small"><b>Do not close Sentinel or press the lock button.</b> iOS stops the camera when the app is closed, in the background, or the iPhone is locked. Use <b>Guard mode</b> instead: black screen, touches blocked, camera keeps streaming. Keep it plugged in.</div>
+  <button class="wake-toggle" aria-pressed="true"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg><span>Keep screen awake</span></button>
+  <div class="grid2"><button class="btn gold" id="dimBtn" data-guard>Guard mode</button><button class="btn crimson" id="stopStation">Stop station</button></div>
   <audio id="talkAudio" playsinline></audio>
 </section>
-<div id="dim" class="dim"><div class="dot"></div>STATION ACTIVE · TAP TO WAKE</div>
+<!-- HELP -->
+<section id="help" class="screen">
+  <div class="topbar"><button class="btn icon ghost" data-back>&#8249;</button><h2>How to use</h2></div>
+  <div class="card small"><h3>Pair in one tap</h3>
+    <p>On the viewing device: <b>+ Add device</b>. On the camera device either scan the QR with the iPhone Camera app, type the 6-character code under <b>Pair with code</b>, or tap a shared link. Tap <b>Approve</b>: the camera starts and the viewer opens the live feed by itself. Both devices remember each other, so next time just open Sentinel.</p></div>
+  <div class="card small"><h3>Stay connected</h3>
+    <p>Each feed reconnects on its own (1 s, 2 s, 4 s … up to every 30 s, forever) and immediately when Wi-Fi returns or you reopen the app. A heartbeat checks the link every 2 s; if the network changes, Sentinel restores the path (ICE restart) without dropping the call. <b>LIVE</b> (red) means new frames in the last 3 s. <b>STALE</b> means connected but frozen. Some strict networks (certain cellular / hotel Wi-Fi) need a TURN relay: add your own in Settings &rarr; ICE servers.</p></div>
+  <div class="card small"><h3>Keep screen awake</h3>
+    <p>With <b>Keep screen awake</b> on, the screen stays on while you monitor or stream (Screen Wake Lock, iOS 16.4+; older iOS uses a silent video trick that needs one tap). iOS releases it whenever you leave Sentinel; it comes back on its own when you return. For all-day use, also plug in and set <b>Settings &rarr; Display &amp; Brightness &rarr; Auto-Lock &rarr; Never</b>.</p></div>
+  <div class="card small"><h3>Guard mode (screen lock)</h3>
+    <p>Tap the lock icon (or <b>Guard mode</b> on a station). The screen goes black and ignores touches, so pockets, kids or pets cannot press anything, while video, recording and wake lock keep running. Press and hold the ring for 2 seconds to unlock, or set a PIN in Settings. Alerts still sound and show a line on the guard screen.</p></div>
+  <div class="notice small"><b>iOS limit:</b> pressing the side button / the real iPhone lock screen, switching apps, or Control Center pauses the camera and microphone. Apple does this for every web app and it cannot be overridden. Use Guard mode instead of locking the phone. Sentinel restarts the camera and reconnects when you return.</div>
+  <div class="card small"><h3>Privacy</h3><p>Video goes device to device, encrypted (WebRTC DTLS-SRTP). The broker only introduces devices. Only devices you approved, holding a per-device secret, can view a station. Nothing is uploaded.</p></div>
+</section>
+<div id="guard" class="guard" aria-label="Guard mode"></div>
 <div id="toast" class="toast"></div>
 </body>
 </html>

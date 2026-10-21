@@ -2,9 +2,11 @@
 // The same class is used for both signaling modes; only the transport of offer/answer differs.
 import { minifySdp } from './codec.js';
 
+// Free public STUN only (no paid relays). TURN is optional and user-supplied in Settings.
+export const DEFAULT_STUN = 'stun:stun.l.google.com:19302, stun:stun1.l.google.com:19302, stun:stun2.l.google.com:19302, stun:stun3.l.google.com:19302';
 export function iceServersFrom(settings) {
   const list = [];
-  const stun = (settings.stun || '').split(/[\s,]+/).filter(Boolean);
+  const stun = (settings.stun || DEFAULT_STUN).split(/[\s,]+/).filter(Boolean);
   if (stun.length) list.push({ urls: stun });
   if (settings.turnUrl) list.push({ urls: settings.turnUrl.split(/[\s,]+/).filter(Boolean), username: settings.turnUser || undefined, credential: settings.turnPass || undefined });
   return list;
@@ -66,6 +68,35 @@ export class MediaSession extends EventTarget {
     return minifySdp(this.pc.localDescription.sdp);
   }
   async acceptAnswer(sdp) { await this.pc.setRemoteDescription({ type: 'answer', sdp }); }
+  // ICE restart (viewer): new ICE credentials over the same session, so the stream resumes without a new call.
+  async createRestartOffer() {
+    await this.pc.setLocalDescription(await this.pc.createOffer({ iceRestart: true }));
+    await waitIce(this.pc, 4000);
+    return minifySdp(this.pc.localDescription.sdp);
+  }
+  // Camera side of an ICE restart / renegotiation on an existing session.
+  async reanswer(sdp) {
+    await this.pc.setRemoteDescription({ type: 'offer', sdp });
+    await this.pc.setLocalDescription(await this.pc.createAnswer());
+    await waitIce(this.pc, 4000);
+    return minifySdp(this.pc.localDescription.sdp);
+  }
+  // Network round trip (ms) from the selected ICE candidate pair, plus decoded video frame count.
+  async stats() {
+    const out = { rtt: null, framesDecoded: null, fps: null, relay: false };
+    try {
+      const r = await this.pc.getStats(); let pairId = null;
+      r.forEach(x => { if (x.type === 'transport' && x.selectedCandidatePairId) pairId = x.selectedCandidatePairId; });
+      r.forEach(x => {
+        if (x.type === 'candidate-pair' && (x.id === pairId || (!pairId && x.nominated && x.state === 'succeeded')) && x.currentRoundTripTime != null) {
+          out.rtt = Math.round(x.currentRoundTripTime * 1000);
+          const lc = r.get(x.localCandidateId); if (lc && lc.candidateType === 'relay') out.relay = true;
+        }
+        if (x.type === 'inbound-rtp' && x.kind === 'video') { out.framesDecoded = x.framesDecoded; out.fps = x.framesPerSecond ?? null; }
+      });
+    } catch { }
+    return out;
+  }
 
   async talk(on) {
     if (!this.audioTx) return;
