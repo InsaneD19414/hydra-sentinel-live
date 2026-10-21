@@ -179,3 +179,12 @@ label.check input{width:22px;height:22px}
 .guard .g-key{height:72px;border-radius:50%;border:1px solid #8C7425;background:#0A0A0A;color:#D4AF37;font-family:Rajdhani,sans-serif;font-size:1.6rem;font-weight:700}
 .guard .g-key[disabled]{visibility:hidden}
 .guard .g-msg{color:#D4AF37;min-height:1.2em;margin-top:8px}
+
+/* v2.1 remote control */
+#monStart{font-family:Cinzel,serif;letter-spacing:.06em;font-weight:700}
+.cd-ack{margin:10px 0;padding:8px 10px;border-radius:8px;border:1px solid #2E2E2E;min-height:1.2em}
+.cd-ack.ok{border-color:#D4AF37;color:#D4AF37}
+.cd-ack.err{border-color:#B11226;color:#E8E8E8}
+#camDlg{max-height:90vh;overflow:auto}
+input[type=range]{padding:0;accent-color:#D4AF37}
+.tile .t-cam{background:#1A1A1A;border-color:#8C7425;color:#D4AF37}

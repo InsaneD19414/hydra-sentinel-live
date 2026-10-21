@@ -133,6 +133,10 @@ export class MediaSession extends EventTarget {
     return minifySdp(this.pc.localDescription.sdp);
   }
   async setVideoTrack(track) { if (this.videoTx && !this.closed) await this.videoTx.sender.replaceTrack(track); }
+  // Cap the outgoing video bitrate (quality preset). Best effort: not every browser exposes encodings.
+  async setMaxBitrate(bps) {
+    try { const snd = this.videoTx && this.videoTx.sender; if (!snd || !snd.getParameters) return false; const p = snd.getParameters(); if (!p.encodings || !p.encodings.length) p.encodings = [{}]; p.encodings[0].maxBitrate = bps; await snd.setParameters(p); return true; } catch { return false; }
+  }
 
   close() {
     if (this.closed) return; this.closed = true;
@@ -145,9 +149,15 @@ export class MediaSession extends EventTarget {
   }
 }
 
-export function cameraConstraints(facing, withAudio) {
+export const RES = { sd: [640, 480], hd: [1280, 720], fhd: [1920, 1080] };
+export const QUALITY_BPS = { low: 500000, medium: 1500000, high: 3000000 };
+export function videoConstraints(res = 'hd', fps = 24) {
+  const [w, h] = RES[res] || RES.hd; const f = Number(fps) || 24;
+  return { width: { ideal: w }, height: { ideal: h }, frameRate: { ideal: f, max: Math.max(f, 30) } };
+}
+export function cameraConstraints(facing, withAudio, res = 'hd', fps = 24) {
   return {
-    video: { facingMode: { ideal: facing }, width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 24, max: 30 } },
+    video: { facingMode: { ideal: facing }, ...videoConstraints(res, fps) },
     audio: withAudio ? { echoCancellation: true, noiseSuppression: true } : false,
   };
 }

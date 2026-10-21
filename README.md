@@ -1,10 +1,15 @@
-# H.A.I.L. Sentinel v2.0
+# H.A.I.L. Sentinel v2.1
 
 Private peer-to-peer camera stations from your own iPhones and iPads. Installable web app (PWA), no App Store.
 
 Live: https://insaned19414.github.io/hydra-sentinel-live/
 
 Video goes device to device over encrypted WebRTC (DTLS-SRTP). Nothing is uploaded. The PeerJS broker only introduces devices.
+
+## What's new in 2.1
+- **Remote start/stop:** a camera device in **Standby** (Sentinel open, camera off, guard on, screen kept awake) is woken by **START MONITORING** on the monitor. It turns on, undims and streams. **Stop cameras** (or a tile's *Stop cam*) sends it back to standby.
+- **Remote camera settings:** the gear on a tile or in the live view sets front/back camera, resolution (480p/720p/1080p), quality (bitrate cap), fps, mic, the camera's alert chime, keep-awake, guard mode and guard darkness. The camera applies them live and returns an ack with the effective resolution and fps.
+- **Auth:** commands are accepted only from a paired monitor presenting that device's per-device secret (strict match, 16+ chars). Values are whitelist-validated. Everything else gets `denied` or `rejected`.
 
 ## What's new in 2.0
 - **One-tap pairing:** QR code (iPhone Camera app opens it), a 6-character typed code (`K7Q-4MZ`), or a share/copy link. Approving on the camera starts it right away, and the viewer opens the live feed by itself. Devices remember each other.

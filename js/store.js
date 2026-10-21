@@ -13,6 +13,10 @@ const DEFAULT_SETTINGS = {
   autoMonitor: false,        // command center: open the monitor grid when Sentinel opens
   alertOffline: true, alertMotion: false, alertSound: true, alertVibrate: true, motionSens: 'medium',
   guardStyle: 'black',       // 'black' | 'dim'
+  guardDim: 100,             // guard overlay darkness, 50-100 %
+  camRes: 'hd', camFps: 24, camQuality: 'medium', camMic: true,  // station capture settings (remote-settable)
+  stationSound: true,        // station: chime when the monitor sends a command
+  autoStandby: false,        // station: enter remote standby when Sentinel opens
   guardPinHash: '', guardPinSalt: '', guardPinLen: 0,
 };
 const OLD_STUN = 'stun:stun.l.google.com:19302';

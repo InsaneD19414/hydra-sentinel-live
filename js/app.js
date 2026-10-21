@@ -1,7 +1,7 @@
 // H.A.I.L. Sentinel - app controller (command center + camera station).
 import { Store, Vault, randomId } from './store.js';
 import { encodePayload, decodePayload } from './codec.js';
-import { MediaSession, iceServersFrom, cameraConstraints } from './rtc.js';
+import { MediaSession, iceServersFrom, cameraConstraints, videoConstraints, QUALITY_BPS } from './rtc.js';
 import { Broker, waitFor, DEFAULT_BROKER } from './signal.js';
 import { drawQr, decodeCanvas, QrScanner } from './qr.js';
 import { nextDelay, makeCode, normalizeCode, formatCode, codePeerId, feedState } from './backoff.js';
@@ -9,7 +9,7 @@ import { Wake, iosVersion } from './wake.js';
 import { Guard, hashPin } from './guard.js';
 import { beep, buzz, unlockAudio, MotionProbe } from './alerts.js';
 
-export const VERSION = '2.0.0';
+export const VERSION = '2.1.0';
 const APP_URL = 'https://insaned19414.github.io/hydra-sentinel-live/';
 // Absolute https deep link: the iOS Camera app opens it straight into Sentinel. Payload rides in the #fragment (never sent to the server).
 function pairLink(payload) { const base = location.protocol === 'https:' ? location.origin + location.pathname : APP_URL; return base + '#p=' + encodeURIComponent(payload); }
@@ -36,8 +36,11 @@ const S = {
   feeds: new Map(),      // stationId -> feed (command center)
   monitor: false,        // monitor grid open
   alerts: [], wake: new Wake(), guard: null, brokerAttempt: 0, brokerP: null,
+  standby: false,        // station: remote standby (camera off, listening, guard on)
+  remote: {}, remoteMsg: {},   // command center: last camera state from acks, per-station status line
 };
 const ICON = {
+  gear: '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 00.3 1.8l.1.1a2 2 0 11-2.8 2.8l-.1-.1a1.7 1.7 0 00-1.8-.3 1.7 1.7 0 00-1 1.5V21a2 2 0 11-4 0v-.1a1.7 1.7 0 00-1.1-1.5 1.7 1.7 0 00-1.8.3l-.1.1a2 2 0 11-2.8-2.8l.1-.1a1.7 1.7 0 00.3-1.8 1.7 1.7 0 00-1.5-1H3a2 2 0 110-4h.1a1.7 1.7 0 001.5-1.1 1.7 1.7 0 00-.3-1.8l-.1-.1a2 2 0 112.8-2.8l.1.1a1.7 1.7 0 001.8.3H9a1.7 1.7 0 001-1.5V3a2 2 0 114 0v.1a1.7 1.7 0 001 1.5 1.7 1.7 0 001.8-.3l.1-.1a2 2 0 112.8 2.8l-.1.1a1.7 1.7 0 00-.3 1.8V9a1.7 1.7 0 001.5 1H21a2 2 0 110 4h-.1a1.7 1.7 0 00-1.5 1z"/></svg>',
   full: '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg>',
 };
 
@@ -335,7 +338,7 @@ async function connectFeed(F) {
     conn.send({ t: 'hello', cc: S.id, secret: dev.secret, n: deviceName() });
     const h = await waitFor(conn, ['hello-ok', 'denied', 'not-active'], 8000);
     if (h.t === 'denied') { F.denied = true; F.note = 'Station refused this command center. Pair again.'; setHealth(F.stationId, 'offline', { note: F.note }); return; }
-    if (h.t === 'not-active') { F.note = 'Station app is open but not started. Tap START STATION on it.'; setHealth(F.stationId, 'stale', { note: F.note }); throw new Error('not active'); }
+    if (h.t === 'not-active') { F.note = h.standby ? 'Camera in standby · tap Start' : 'Station app is open but not started. Tap Start (or START STATION on it).'; F.standby = !!h.standby; setHealth(F.stationId, 'stale', { note: F.note }); throw new Error('not active'); }
     const session = new MediaSession('viewer', S.settings);
     const sdp = await session.createOffer();
     conn.send({ t: 'offer', sid: session.sid, sdp });
@@ -440,6 +443,93 @@ function heartbeat() {
 }
 setInterval(heartbeat, HB_MS);
 
+// ----- remote control (command center side): authenticated commands over the broker link -----
+async function sendCmd(stationId, cmd, args = {}, timeoutMs = 20000) {
+  const dev = devFor(stationId);
+  if (!dev) throw new Error('No device assigned to this station');
+  if (dev.mode === 'offline') throw new Error('Remote control needs broker mode (this camera was paired with offline QR)');
+  await ensureBroker();
+  if (!S.broker || S.broker.status !== 'online') throw new Error('Broker offline');
+  const conn = await S.broker.connect(dev.id, 9000);
+  try {
+    const id = randomId(6);
+    conn.send({ t: 'cmd', id, cmd, args, cc: S.id, secret: dev.secret, n: deviceName() });
+    const r = await waitFor(conn, ['cmd-ack', 'denied'], timeoutMs);
+    if (r.t === 'denied') throw new Error('Camera refused: pair again');
+    if (r.state) { F_state(stationId, r.state); }
+    if (!r.ok) throw new Error(r.error || 'failed');
+    return r;
+  } finally { setTimeout(() => { try { conn.close(); } catch { } }, 200); }
+}
+function F_state(stationId, st) { S.remote[stationId] = Object.assign(S.remote[stationId] || {}, st, { at: Date.now() }); }
+async function remoteStart(stationId) {
+  const st = Store.stations().find(s => s.id === stationId); const name = st ? st.name : 'Camera';
+  setRemoteMsg(stationId, 'Starting camera…');
+  try {
+    await sendCmd(stationId, 'start', {}, 25000);
+    setRemoteMsg(stationId, '');
+    const F = S.feeds.get(stationId) || openFeed(stationId); F.note = ''; F.standby = false; retryNow(F);
+    return true;
+  } catch (e) { setRemoteMsg(stationId, 'Start failed: ' + e.message); toast(`${name}: ${e.message}`, 4000); return false; }
+}
+async function remoteStop(stationId) {
+  try { await sendCmd(stationId, 'stop'); closeFeed(stationId); setRemoteMsg(stationId, 'Camera in standby'); return true; }
+  catch (e) { toast('Stop failed: ' + e.message, 4000); return false; }
+}
+async function startMonitoring() {
+  unlockAudio();
+  if (!S.monitor) openMonitor();
+  const list = assigned().filter(st => devFor(st.id)?.mode !== 'offline');
+  if (!list.length) return toast('No broker-paired cameras yet. Tap + Add a camera.');
+  $('#monStart').disabled = true;
+  const res = await Promise.all(list.map(st => remoteStart(st.id)));
+  $('#monStart').disabled = false;
+  const ok = res.filter(Boolean).length;
+  toast(`${ok}/${list.length} camera${list.length === 1 ? '' : 's'} started`);
+}
+async function stopMonitoring() {
+  const list = assigned().filter(st => devFor(st.id)?.mode !== 'offline');
+  await Promise.all(list.map(st => remoteStop(st.id)));
+}
+function setRemoteMsg(stationId, m) { S.remoteMsg[stationId] = m; renderGrid(); }
+
+// Remote settings dialog
+let camDlgStation = null;
+function fillCamDlg(st) {
+  const s = st.settings || {};
+  $$('#camDlg [data-k]').forEach(el => {
+    const k = el.dataset.k; const v = s[k];
+    if (el.type === 'checkbox') el.checked = !!v; else if (v !== undefined) el.value = String(v);
+  });
+  $('#cdDimVal').textContent = ($('#cd_guardDim').value || 100) + '%';
+  const e = st.effective || {};
+  $('#cdState').innerHTML = `${st.active ? '<span class="dot on"></span>Streaming' : st.standby ? '<span class="dot"></span>Standby' : '<span class="dot"></span>Camera off'} · ${st.viewers || 0} viewer(s)${e.width ? ` · <span class="mono">${e.width}×${e.height} @ ${e.frameRate || '?'} fps</span>` : ''} · mic ${st.mic ? 'on' : 'off'} · guard ${st.guard ? 'on' : 'off'} · screen ${esc(st.wake || '')}`;
+}
+async function openCamDlg(stationId) {
+  camDlgStation = stationId;
+  const st = Store.stations().find(x => x.id === stationId);
+  $('#cdTitle').textContent = (st ? st.name : 'Camera') + ' settings';
+  $('#cdAck').textContent = 'Reading settings from the camera…'; $('#cdAck').className = 'cd-ack muted small';
+  $('#cdApply').disabled = true; $('#camDlg').showModal();
+  try { const r = await sendCmd(stationId, 'get'); fillCamDlg(r.state); $('#cdAck').textContent = 'Current settings loaded from the camera.'; $('#cdApply').disabled = false; }
+  catch (e) { $('#cdAck').textContent = 'Camera not reachable: ' + e.message; $('#cdAck').className = 'cd-ack err small'; $('#cdApply').disabled = false; }
+}
+async function applyCamDlg() {
+  const id = camDlgStation; if (!id) return;
+  const args = {};
+  $$('#camDlg [data-k]').forEach(el => { const k = el.dataset.k; args[k] = el.type === 'checkbox' ? el.checked : (['camFps', 'guardDim'].includes(k) ? Number(el.value) : el.value); });
+  $('#cdApply').disabled = true; $('#cdAck').textContent = 'Sending…'; $('#cdAck').className = 'cd-ack muted small';
+  try {
+    const r = await sendCmd(id, 'settings', args);
+    fillCamDlg(r.state);
+    const e = r.state.effective || {};
+    $('#cdAck').innerHTML = `&#10003; Applied on ${esc(r.state.name)} at ${new Date(r.at).toLocaleTimeString()}${e.width ? ` · now ${e.width}×${e.height} @ ${e.frameRate || '?'} fps` : ''} · ${r.state.settings.facing === 'user' ? 'front' : 'back'} camera`;
+    $('#cdAck').className = 'cd-ack ok small';
+    window.SentinelDebug.lastAck = r;
+  } catch (e) { $('#cdAck').textContent = '✗ Not applied: ' + e.message; $('#cdAck').className = 'cd-ack err small'; window.SentinelDebug.lastAck = { ok: false, error: e.message }; }
+  finally { $('#cdApply').disabled = false; }
+}
+
 // ----- focused live view (fullscreen of one feed) -----
 async function startLive(stationId, offlineSession = null) {
   const st = Store.stations().find(s => s.id === stationId);
@@ -489,7 +579,9 @@ function renderGrid() {
     let t = tileFor(st.id);
     if (!t) {
       t = document.createElement('div'); t.className = 'tile'; t.dataset.st = st.id;
-      t.innerHTML = `<video playsinline autoplay muted></video><div class="t-top"><span class="t-name"></span><span class="t-chip"></span></div><div class="t-msg"></div><div class="t-bot"><span class="t-info mono"></span><button class="btn icon t-act"></button><button class="btn icon ghost t-full" aria-label="Fullscreen">${ICON.full}</button></div>`;
+      t.innerHTML = `<video playsinline autoplay muted></video><div class="t-top"><span class="t-name"></span><span class="t-chip"></span></div><div class="t-msg"></div><div class="t-bot"><span class="t-info mono"></span><button class="btn icon t-cam"></button><button class="btn icon ghost t-gear" aria-label="Camera settings">${ICON.gear}</button><button class="btn icon t-act"></button><button class="btn icon ghost t-full" aria-label="Fullscreen">${ICON.full}</button></div>`;
+      t.querySelector('.t-cam').onclick = () => { const live = ['live', 'stale'].includes(health(st.id).state) && S.feeds.get(st.id)?.session; live ? remoteStop(st.id) : remoteStart(st.id); };
+      t.querySelector('.t-gear').onclick = () => openCamDlg(st.id);
       t.querySelector('video').addEventListener('click', () => { const F = S.feeds.get(st.id); if (F && F.session) focusFeed(F); else if (F && F.offline) openOffline(st.id); else if (F) retryNow(F); });
       t.querySelector('.t-full').onclick = () => { const F = S.feeds.get(st.id) || openFeed(st.id); focusFeed(F); };
       t.querySelector('.t-act').onclick = () => { const F = S.feeds.get(st.id); if (F) closeFeed(st.id); else openFeed(st.id); };
@@ -499,13 +591,15 @@ function renderGrid() {
     const F = S.feeds.get(st.id);
     const v = t.querySelector('video'); if (F) attachVideo(v, F); else { v.srcObject = null; v._feed = null; }
     t.querySelector('.t-act').textContent = F ? 'Disconnect' : 'Connect';
+    t.querySelector('.t-cam').textContent = F && F.session && ['live', 'stale'].includes(health(st.id).state) ? 'Stop cam' : 'Start cam';
     paintTile(t, st, F);
   }
   $('#gridEmpty').hidden = list.length > 0;
   const live = Array.from(S.feeds.values()).filter(f => health(f.stationId).state === 'live').length;
   $('#monSummary').innerHTML = `<span class="dot ${live ? 'on' : ''}"></span>${live}/${list.length} live`;
 }
-function feedText(F) {
+function feedText(F, stId) {
+  const rm = S.remoteMsg[stId || (F && F.stationId)]; if (rm) return rm;
   if (!F) return 'Disconnected';
   const h = health(F.stationId).state;
   if (h === 'live' || h === 'stale') return '';
@@ -525,9 +619,10 @@ function feedInfo(F) {
 }
 function paintTile(t, st, F) {
   const h = F ? health(st.id).state : 'offline';
-  t.querySelector('.t-chip').innerHTML = chip(F ? h : 'offline', F ? null : 'Off');
+  const sb = (F && F.standby && !['live', 'stale'].includes(h)) || (!F && /standby/i.test(S.remoteMsg[st.id] || ''));
+  t.querySelector('.t-chip').innerHTML = sb ? chip('offline', 'Standby') : chip(F ? h : 'offline', F ? null : 'Off');
   t.dataset.state = h;
-  const msg = feedText(F); const m = t.querySelector('.t-msg'); m.textContent = msg; m.hidden = !msg;
+  const msg = feedText(F, st.id); const m = t.querySelector('.t-msg'); m.textContent = msg; m.hidden = !msg;
   t.querySelector('.t-info').textContent = feedInfo(F);
 }
 function paintFocused() {
@@ -573,7 +668,7 @@ setInterval(async () => {
     }
     const h = health(F.stationId).state;
     if (h === 'live') {
-      F.downSince = 0; F.alerted = false; F.wasLive = true;
+      F.downSince = 0; F.alerted = false; F.wasLive = true; if (S.remoteMsg[F.stationId]) S.remoteMsg[F.stationId] = '';
       if (!F.snapAt || Date.now() - F.snapAt > 10000) { F.snapAt = Date.now(); snapshot(F); }
       if (S.settings.alertMotion && tickN % 2 === 0) {
         const v = S.live === F ? $('#liveVideo') : tileFor(F.stationId)?.querySelector('video');
@@ -659,14 +754,15 @@ function openStatus() {
 async function ensureCamera() {
   const C = S.station;
   if (C.cam && C.cam.getVideoTracks().some(t => t.readyState === 'live')) return C.cam;
-  C.cam = await navigator.mediaDevices.getUserMedia(cameraConstraints(S.settings.facing || 'environment', true));
+  C.cam = await navigator.mediaDevices.getUserMedia(cameraConstraints(S.settings.facing || 'environment', true, S.settings.camRes, S.settings.camFps));
   C.cam.getVideoTracks()[0].addEventListener('ended', () => renderStationStatus());
+  C.cam.getAudioTracks().forEach(t => { t.enabled = S.settings.camMic !== false; });
   $('#stationPreview').srcObject = C.cam;
   for (const s of C.sessions) { await s.setVideoTrack(C.cam.getVideoTracks()[0]); }
   return C.cam;
 }
 // Keep the screen awake while anything is being watched or streamed (and the user has not turned it off).
-function watching() { return S.station.active || S.feeds.size > 0 || (S.guard && S.guard.on); }
+function watching() { return S.station.active || S.standby || S.feeds.size > 0 || (S.guard && S.guard.on); }
 function updateWake() { if (S.settings.keepAwake && watching()) S.wake.enable(); else if (S.wake.wanted) S.wake.disable(); paintWake(); }
 function requestWake() { updateWake(); } // fire-and-forget: never blocks camera start
 function wakeLabel() {
@@ -693,7 +789,8 @@ async function startStation() {
   if (S.settings.signaling === 'peerjs' && (!S.broker || S.broker.status !== 'online')) startBroker();
   return true;
 }
-function stopStation() {
+function stopStation(keepStandby = false) {
+  if (!keepStandby) S.standby = false;
   const C = S.station; C.active = false;
   for (const s of C.sessions) s.close(); C.sessions.clear();
   if (C.cam) C.cam.getTracks().forEach(t => t.stop()); C.cam = null;
@@ -701,12 +798,12 @@ function stopStation() {
   updateWake();
   show('stationHome', false); S.history = []; render();
 }
-async function stationSwitchCamera() {
+async function stationSwitchCamera(target) {
   const C = S.station;
-  const facing = (S.settings.facing === 'user') ? 'environment' : 'user';
+  const facing = target || ((S.settings.facing === 'user') ? 'environment' : 'user');
   const old = C.cam && C.cam.getVideoTracks()[0];
   if (old) { old.stop(); C.cam.removeTrack(old); }
-  const s = await navigator.mediaDevices.getUserMedia(cameraConstraints(facing, false));
+  const s = await navigator.mediaDevices.getUserMedia(cameraConstraints(facing, false, S.settings.camRes, S.settings.camFps));
   const v = s.getVideoTracks()[0];
   if (!C.cam) C.cam = s; else C.cam.addTrack(v);
   $('#stationPreview').srcObject = C.cam;
@@ -741,6 +838,71 @@ setInterval(() => {
   for (const s of S.station.sessions) if (s.lastHb && Date.now() - s.lastHb > 20000 && s.state !== 'connected') s.close();
   if ($('#stationActive').classList.contains('active')) renderStationStatus();
 }, 5000);
+// ---------- remote control (station side) ----------
+// Standby = Sentinel open, camera off, screen kept awake behind Guard mode, listening for the monitor.
+function enterStandby() {
+  S.standby = true;
+  if (S.station.active) stopStation(true);
+  show('stationHome', false); S.history = []; render();
+  S.guard.engage(); updateWake();
+}
+function leaveStandby() { S.standby = false; updateWake(); render(); }
+// Strict check for commands: the command center must be paired AND present its per-device secret.
+function cmdAuth(ccId, secret) { return Store.devices().find(d => d.id === ccId && typeof d.secret === 'string' && d.secret.length >= 16 && d.secret === secret) || null; }
+const REMOTE_SCHEMA = {
+  facing: v => ['user', 'environment'].includes(v), camRes: v => ['sd', 'hd', 'fhd'].includes(v), camFps: v => [10, 15, 24, 30].includes(Number(v)),
+  camQuality: v => ['low', 'medium', 'high'].includes(v), camMic: v => typeof v === 'boolean', stationSound: v => typeof v === 'boolean',
+  keepAwake: v => typeof v === 'boolean', guard: v => typeof v === 'boolean', guardDim: v => Number(v) >= 50 && Number(v) <= 100,
+};
+function stationSnapshot() {
+  const C = S.station; const v = C.cam && C.cam.getVideoTracks()[0]; const a = C.cam && C.cam.getAudioTracks()[0];
+  let eff = {}; try { const g = v && v.readyState === 'live' ? v.getSettings() : {}; eff = { width: g.width, height: g.height, frameRate: g.frameRate ? Math.round(g.frameRate) : undefined }; } catch { }
+  const st = S.settings;
+  return { active: !!C.active, standby: !!S.standby, guard: !!(S.guard && S.guard.on), wake: S.wake.state, viewers: Array.from(C.sessions).filter(x => x.state === 'connected').length,
+    mic: a ? a.enabled : st.camMic !== false, effective: eff, name: deviceName(),
+    settings: { facing: st.facing || 'environment', camRes: st.camRes, camFps: Number(st.camFps), camQuality: st.camQuality, camMic: st.camMic !== false, stationSound: st.stationSound !== false, keepAwake: !!st.keepAwake, guard: !!(S.guard && S.guard.on), guardDim: Number(st.guardDim) || 100 } };
+}
+async function applyRemoteSettings(args) {
+  const bad = Object.keys(args || {}).filter(k => !REMOTE_SCHEMA[k] || !REMOTE_SCHEMA[k](args[k]));
+  if (bad.length) throw new Error('rejected: ' + bad.join(', '));
+  const C = S.station; const p = {};
+  for (const k of ['camRes', 'camQuality', 'camMic', 'stationSound', 'keepAwake']) if (k in args) p[k] = args[k];
+  if ('camFps' in args) p.camFps = Number(args.camFps);
+  if ('guardDim' in args) p.guardDim = Number(args.guardDim);
+  S.settings = Store.patchSettings(p);
+  if (C.cam) {
+    if ('facing' in args && args.facing !== (S.settings.facing || 'environment')) await stationSwitchCamera(args.facing);
+    else if ('facing' in args) S.settings = Store.patchSettings({ facing: args.facing });
+    const v = C.cam.getVideoTracks()[0];
+    if (v && ('camRes' in args || 'camFps' in args)) await v.applyConstraints(videoConstraints(S.settings.camRes, S.settings.camFps)).catch(e => { throw new Error('camera refused ' + S.settings.camRes + '@' + S.settings.camFps + ': ' + e.name); });
+    C.cam.getAudioTracks().forEach(t => { t.enabled = S.settings.camMic !== false; });
+  } else if ('facing' in args) S.settings = Store.patchSettings({ facing: args.facing });
+  if ('camQuality' in args || C.cam) for (const x of C.sessions) await x.setMaxBitrate(QUALITY_BPS[S.settings.camQuality] || QUALITY_BPS.medium);
+  if ('guard' in args) { if (args.guard && !S.guard.on) S.guard.engage(); else if (!args.guard && S.guard.on) S.guard.release(); }
+  if (S.guard.on) S.guard.applyDim();
+  updateWake(); renderStationStatus();
+}
+async function stHandleCmd(conn, msg) {
+  const cc = cmdAuth(msg.cc, msg.secret);
+  if (!cc) { conn.send({ t: 'cmd-ack', id: msg.id, ok: false, error: 'denied: not a paired monitor' }); return; }
+  if (S.settings.role !== 'station') { conn.send({ t: 'cmd-ack', id: msg.id, ok: false, error: 'this device is not a camera station' }); return; }
+  if (S.settings.stationSound !== false && msg.cmd !== 'get') beep('cmd');
+  try {
+    if (msg.cmd === 'start') {
+      S.standby = false;
+      if (S.guard.on) S.guard.release(); // undim
+      if (!S.station.active) { const ok = await startStation(); if (!ok) throw new Error('camera blocked: allow Camera for Sentinel on the camera device'); }
+      else show('stationActive');
+      toast(`Started remotely by ${cc.n || 'command center'}`);
+    } else if (msg.cmd === 'stop') {
+      enterStandby(); toast(`Stopped remotely by ${cc.n || 'command center'} · standby`);
+    } else if (msg.cmd === 'settings') {
+      await applyRemoteSettings(msg.args || {}); toast(`Settings changed by ${cc.n || 'command center'}`);
+    } else if (msg.cmd !== 'get') throw new Error('unknown command');
+    conn.send({ t: 'cmd-ack', id: msg.id, ok: true, cmd: msg.cmd, state: stationSnapshot(), at: Date.now() });
+  } catch (e) { conn.send({ t: 'cmd-ack', id: msg.id, ok: false, cmd: msg.cmd, error: e.message, state: stationSnapshot(), at: Date.now() }); }
+  window.SentinelDebug.lastCmd = { cmd: msg.cmd, from: cc.n };
+}
 function pairedCC(ccId, secret) { return Store.devices().find(d => d.id === ccId && (!d.secret || d.secret === secret)); }
 function stIncoming(conn) {
   let authed = null; const bySid = new Map();
@@ -748,11 +910,13 @@ function stIncoming(conn) {
     if (!msg || !msg.t) return;
     if (msg.t === 'ping') {
       const cc = pairedCC(msg.cc, msg.secret);
-      conn.send(cc ? { t: 'pong', cam: S.station.active && !!S.station.cam, n: deviceName(), facing: S.settings.facing } : { t: 'denied' });
+      conn.send(cc ? { t: 'pong', cam: S.station.active && !!S.station.cam, standby: !!S.standby, n: deviceName(), facing: S.settings.facing } : { t: 'denied' });
+    } else if (msg.t === 'cmd') {
+      stHandleCmd(conn, msg);
     } else if (msg.t === 'hello') {
       const cc = pairedCC(msg.cc, msg.secret);
       if (!cc) return conn.send({ t: 'denied' });
-      if (!S.station.active) return conn.send({ t: 'not-active' });
+      if (!S.station.active) return conn.send({ t: 'not-active', standby: !!S.standby });
       authed = cc; conn.send({ t: 'hello-ok' });
     } else if (msg.t === 'offer' && authed && msg.restart && bySid.has(msg.sid) && !bySid.get(msg.sid).closed) {
       try { conn.send({ t: 'answer', sid: msg.sid, sdp: await bySid.get(msg.sid).reanswer(msg.sdp) }); } // ICE restart on the live session
@@ -763,6 +927,7 @@ function stIncoming(conn) {
         const session = new MediaSession('camera', S.settings);
         const sdp = await session.answerOffer(msg.sdp, cam);
         wireStationSession(session, authed.n); bySid.set(msg.sid, session);
+        session.addEventListener('state', e => { if (e.detail === 'connected') session.setMaxBitrate(QUALITY_BPS[S.settings.camQuality] || QUALITY_BPS.medium); });
         conn.send({ t: 'answer', sid: msg.sid, sdp });
       } catch (e) { conn.send({ t: 'error', error: String(e) }); }
     }
@@ -925,8 +1090,9 @@ function renderSettings() {
   $('#setName').value = s.deviceName || '';
   $('#bHost').value = s.broker.host; $('#bPort').value = s.broker.port; $('#bPath').value = s.broker.path; $('#bKey').value = s.broker.key; $('#bSecure').value = String(s.broker.secure !== false);
   $('#sStun').value = s.stun; $('#sTurn').value = s.turnUrl; $('#sTurnU').value = s.turnUser; $('#sTurnP').value = s.turnPass;
-  for (const k of ['keepAwake', 'autoStart', 'autoMonitor', 'alertOffline', 'alertMotion', 'alertSound', 'alertVibrate']) $('#set_' + k).checked = !!s[k];
-  $('#setSens').value = s.motionSens || 'medium'; $('#setGuardStyle').value = s.guardStyle || 'black';
+  for (const k of ['keepAwake', 'autoStart', 'autoStandby', 'autoMonitor', 'alertOffline', 'alertMotion', 'alertSound', 'alertVibrate']) $('#set_' + k).checked = !!s[k];
+  $('#setGuardDim').value = Number(s.guardDim) || (s.guardStyle === 'dim' ? 88 : 100); $('#rowAutoStandby').hidden = s.role !== 'station';
+  $('#setSens').value = s.motionSens || 'medium';
   $('#pinState').textContent = s.guardPinHash ? `PIN set (${s.guardPinLen} digits)` : 'No PIN: unlock by press-and-hold';
   $('#setPin').value = ''; $('#clearPin').hidden = !s.guardPinHash;
   $('#rowAutoStart').hidden = s.role !== 'station'; $('#rowAutoMonitor').hidden = s.role !== 'command';
@@ -983,8 +1149,9 @@ function wire() {
       deviceName: $('#setName').value.trim(), signaling: $('#segSig button.on')?.dataset.v || 'peerjs',
       broker: { host: $('#bHost').value.trim() || DEFAULT_BROKER.host, port: Number($('#bPort').value) || 443, path: $('#bPath').value.trim() || '/', key: $('#bKey').value.trim() || 'peerjs', secure: $('#bSecure').value === 'true' },
       stun: $('#sStun').value.trim(), turnUrl: $('#sTurn').value.trim(), turnUser: $('#sTurnU').value.trim(), turnPass: $('#sTurnP').value,
-      ...Object.fromEntries(['keepAwake', 'autoStart', 'autoMonitor', 'alertOffline', 'alertMotion', 'alertSound', 'alertVibrate'].map(k => [k, $('#set_' + k).checked])),
-      motionSens: $('#setSens').value, guardStyle: $('#setGuardStyle').value,
+      guardDim: Number($('#setGuardDim').value) || 100,
+      ...Object.fromEntries(['keepAwake', 'autoStart', 'autoStandby', 'autoMonitor', 'alertOffline', 'alertMotion', 'alertSound', 'alertVibrate'].map(k => [k, $('#set_' + k).checked])),
+      motionSens: $('#setSens').value,
     });
     const pin = $('#setPin').value.trim();
     if (pin) {
@@ -998,11 +1165,16 @@ function wire() {
   $('#startStation').onclick = startStation;
   $('#stationScan').onclick = () => openScanner('Scan the pairing code on the command center.');
   $('#approveYes').onclick = stApprove; $('#approveNo').onclick = stDeny;
-  $('#stopStation').onclick = stopStation;
+  $('#stopStation').onclick = () => stopStation();
+  $('#standbyBtn').onclick = () => { unlockAudio(); enterStandby(); };
   $$('[data-guard]').forEach(b => b.onclick = () => { unlockAudio(); S.guard.engage(); });
   $$('.wake-toggle').forEach(b => b.onclick = toggleWake);
   $$('[data-help]').forEach(b => b.onclick = () => show('help'));
   $('#monitorBtn').onclick = () => { unlockAudio(); openMonitor(); };
+  $('#monStart').onclick = startMonitoring; $('#monStop').onclick = stopMonitoring;
+  $('#liveGear').onclick = () => { if (S.live) openCamDlg(S.live.stationId); };
+  $('#cdApply').onclick = applyCamDlg; $('#cdClose').onclick = () => $('#camDlg').close();
+  $('#cd_guardDim').oninput = e => { $('#cdDimVal').textContent = e.target.value + '%'; };
   $('#monBack').onclick = leaveMonitor;
   $('#monConnectAll').onclick = () => { assigned().forEach(st => { const F = S.feeds.get(st.id); F ? retryNow(F) : openFeed(st.id); }); };
   $('#monDisconnectAll').onclick = () => closeAllFeeds();
@@ -1024,11 +1196,12 @@ function wire() {
   window.addEventListener('online', () => { $('#netBar').classList.remove('show'); toast('Back online · reconnecting'); reconnectEverything('online'); });
   window.addEventListener('offline', () => $('#netBar').classList.add('show'));
   window.addEventListener('pageshow', e => { if (e.persisted) reconnectEverything('pageshow'); });
-  S.wake.addEventListener('change', paintWake);
+  S.wake.addEventListener('change', () => { paintWake(); if (S.guard && S.guard.on) S.guard.tick(); });
 }
 function guardStatus() {
   const a = S.alerts[0] && Date.now() - S.alerts[0].at < 60000 ? `<div class="g-alert">${esc(S.alerts[0].text)}</div>` : '';
   const awake = S.wake.state === 'on' || S.wake.state === 'fallback' ? 'screen awake' : 'screen may sleep';
+  if (S.settings.role === 'station' && S.standby && !S.station.active) return `<span class="dot"></span>STANDBY · waiting for the monitor · ${awake}${a}`;
   if (S.settings.role === 'station') { const n = Array.from(S.station.sessions).filter(s => s.state === 'connected').length; return `<span class="dot ${S.station.active ? 'on' : ''}"></span>${S.station.active ? 'STATION ACTIVE' : 'STATION STOPPED'} · ${n} viewer${n === 1 ? '' : 's'} · ${awake}${a}`; }
   const live = Array.from(S.feeds.values()).filter(f => health(f.stationId).state === 'live').length;
   return `<span class="dot ${live ? 'on' : ''}"></span>${live}/${S.feeds.size} cameras live · ${awake}${a}`;
@@ -1048,7 +1221,7 @@ function handleDeepLink() {
 
 window.SentinelDebug = {
   S, Store, Vault, handleScan, pickStation, liveButtonState, openPair, openOffline, startLive, stopLive, pickMime,
-  openMonitor, leaveMonitor, closeFeed, openFeed, retryNow, reconnectEverything, tryIceRestart, joinByCode, updateWake, raiseAlert, nextDelay,
+  openMonitor, leaveMonitor, sendCmd, remoteStart, remoteStop, startMonitoring, openCamDlg, enterStandby, closeFeed, openFeed, retryNow, reconnectEverything, tryIceRestart, joinByCode, updateWake, raiseAlert, nextDelay,
   stopCameraTrack() { const t = S.station.cam && S.station.cam.getVideoTracks()[0]; if (t) t.stop(); return !!t; },
   decodeQrCanvas(sel) { return decodeCanvas(document.querySelector(sel)); },
 };
@@ -1068,6 +1241,7 @@ async function boot() {
   const q = new URLSearchParams(location.search);
   if (!q.has('action') && !location.hash) {
     if (S.settings.role === 'command' && S.settings.autoMonitor && assigned().length) setTimeout(openMonitor, 600);
+    if (S.settings.role === 'station' && S.settings.autoStandby && !S.settings.autoStart && Store.devices().length) setTimeout(enterStandby, 600);
     if (S.settings.role === 'station' && S.settings.autoStart && Store.devices().length) setTimeout(() => startStation().then(ok => { if (!ok) toast('Tap START STATION to turn the camera on'); }), 600);
   }
   if ('serviceWorker' in navigator && location.protocol !== 'file:') {

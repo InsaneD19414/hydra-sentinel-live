@@ -21,11 +21,16 @@ export class Guard extends EventTarget {
   }
   hasPin() { const s = this.getSettings(); return !!(s.guardPinHash && s.guardPinSalt); }
   engage() {
-    this.on = true; this.entry = ''; this.el.classList.toggle('dimmed', this.getSettings().guardStyle === 'dim');
+    this.on = true; this.entry = ''; this.applyDim();
     this.el.classList.add('show'); this.el.querySelector('#gPin').hidden = true; this.el.querySelector('#gHold').hidden = false;
     this.el.querySelector('#gHoldTxt').textContent = this.hasPin() ? 'TAP TO ENTER PIN' : 'HOLD TO UNLOCK';
     this.tick(); clearInterval(this.t); this.t = setInterval(() => this.tick(), 1000);
     this.dispatchEvent(new Event('engage'));
+  }
+  // Darkness 50-100 %: 100 = pure black (OLED pixels off); lower lets the feed show through faintly.
+  applyDim() {
+    const st = this.getSettings(); let d = Number(st.guardDim); if (!d) d = st.guardStyle === 'dim' ? 88 : 100;
+    d = Math.max(50, Math.min(100, d)); this.el.style.background = `rgba(0,0,0,${d / 100})`; this.el.dataset.dim = d;
   }
   release() { this.on = false; clearInterval(this.t); this.el.classList.remove('show', 'awake'); this.dispatchEvent(new Event('release')); }
   poke() { this.el.classList.add('awake'); clearTimeout(this.pokeT); this.pokeT = setTimeout(() => this.el.classList.remove('awake'), 4000); }

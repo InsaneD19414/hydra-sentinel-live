@@ -7,7 +7,7 @@ export function unlockAudio() {
 export function beep(kind = 'offline') {
   try {
     unlockAudio(); if (!ctx) return false;
-    const seq = kind === 'motion' ? [880, 0, 880] : [660, 440];
+    const seq = kind === 'motion' ? [880, 0, 880] : kind === 'cmd' ? [990, 1320] : [660, 440];
     let t = ctx.currentTime;
     for (const f of seq) {
       if (f) { const o = ctx.createOscillator(), g = ctx.createGain(); o.type = 'square'; o.frequency.value = f; g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(0.18, t + 0.02); g.gain.exponentialRampToValueAtTime(0.0001, t + 0.18); o.connect(g).connect(ctx.destination); o.start(t); o.stop(t + 0.2); }
